@@ -1,10 +1,36 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**菜单面板升级为路由容器：表情/符号网格直接铺在面板区（不占候选栏），剪切板/快捷发送置灰**（2026-08-22）
+**诊断：复制内容后 QQ 等窗口无法输入中文 = 客户端 Chromium text-input-v3 bug，非 Xime 缺陷**（2026-08-28）
+
+## 诊断记录（2026-08-28）：复制后某些窗口（QQ 最明显）无法输入中文
+**现象**：复制内容后在 QQ 聊天窗口打不了中文，托盘图标消失；需切到可输入窗口启用后才恢复。
+
+**根因**（日志 + KWin 6.3.6 源码 + 客户端版本三方实锤）：
+1. 复制时点击消息气泡 → 输入框失焦 → QQ 的 Chromium 调 `text-input-v3.disable` → KWin 向 IM 发 DEACTIVATE（journal 可见 `State changed: active=false`，托盘 Passive，与"图标消失"吻合）
+2. 点回输入框后 QQ 本应重新 `enable`，但 **QQ 3.2.29 内置 Chromium 138 有 bug：disable 后不再重新 enable**（KWin bug 493098，Chromium 139 修复）；KWin `refreshActive()` 只认客户端 enable → 永不 ACTIVATE
+3. 切到其他窗口：那边的应用正常 enable → ACTIVATE 恢复；切回 QQ 时走窗口焦点切换路径才触发 QQ 重新 enable
+4. 对照组：VS Code（Chromium/148）正常、Brave 正常——只有旧 Chromium 应用中招
+5. journal 佐证：22:32:56 DEACTIVATE 后 15 秒零 ACTIVATE；当日 DEACTIVATE 386 次 vs ACTIVATE 773 次（双 context 异常比例）
+
+**KWin 侧验证过的死路**：DBus `org.kde.kwin.VirtualKeyboard.forceActivate()` 虽存在，但客户端 text-input 处于 disabled 时，KWin 会把中文 commit 丢弃（fake-key 路径仅支持少量 ASCII 键），故 daemon 侧无法单独恢复中文上屏。
+
+**用户级规避**：
+- 复制后在 QQ 内 alt-tab 切走再切回（触发 Chromium 焦点路径重新 enable），比切到"能打的窗口"更快
+- 等 QQ 升级到 Chromium ≥ 139 的版本；验证方法：`strings /opt/QQ/qq | grep -oE "Chrome/[0-9.]+" | head -1`
+
+**遗留可选功能**（未实现）：daemon 检测死锁态 → DBus forceActivate + zwp_virtual_keyboard 自定义 keymap 合成按键上屏中文（工作量大，需独立功能点）
 
 ## 本次变更（2026-08-22）
-1. **修复内容网格宽度不足**：单元格固定 36px 导致颜文字换行、排列错位
+**菜单面板升级为路由容器：表情/符号网格直接铺在面板区（不占候选栏），剪切板/快捷发送置灰**
+
+## 本次变更（2026-08-22）
+1. **Ctrl+Space 启停输入法**（fcitx 风格）
+   - 任意状态下 Ctrl+Space 切换全局启停开关（`im_enabled`）
+   - 停用：丢弃 rime 组合（`clear_composition` 原始 API）、清空 preedit、隐藏候选栏/菜单/Ctrl 字根、托盘显示英文
+   - 停用态按键直接转发不做处理（被消费按下的释放仍抑制，避免孤儿释放）；再次 Ctrl+Space 恢复
+   - rime-wubi 配置无 Ctrl+Space 绑定，此前该键被直接转发给应用（功能缺失）
+2. **修复内容网格宽度不足**：单元格固定 36px 导致颜文字换行、排列错位
    - 按最宽项估算单元格宽（`content_text_width`：ASCII 10px/CJK 17px/零宽组合符 0，保守偏大 +16 内边距）
    - 列数在 660px 上限内自适应（4..=10 列）；面板宽度随内容变化（颜文字页 7 列 ≈645px，纯符号 10 列 414px）
    - 单元格文本 `Wrapping::None` 禁止换行兜底；渲染/命中测试共用同一纯函数保证一致

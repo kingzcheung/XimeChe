@@ -1,3 +1,4 @@
+mod clipboard_sync;
 mod command;
 mod daemon;
 mod plugin_host;
@@ -5,6 +6,7 @@ mod rime;
 mod symbols;
 mod wayland;
 
+pub use clipboard_sync::{scan_descriptors, spawn_bridge, SyncMessage, SyncPluginDescriptor};
 pub use command::DaemonCommand;
 pub use daemon::XimeDaemon;
 pub use plugin_host::{plugins_dir, PluginHost};

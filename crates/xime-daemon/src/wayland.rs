@@ -14,6 +14,7 @@ use xime_wayland::{connect_im_from_fd, connect_im_to_env, ImBackend};
 use xime_xkb::XkbContext;
 use xime_xkb::{keysym_to_letter, Keysym, ModifierState};
 
+use crate::clipboard_sync::{scan_descriptors, SyncMessage};
 use crate::{symbols, DaemonCommand, PluginHost, RimeEngine};
 
 /// 搜索面板模式。
@@ -171,6 +172,8 @@ pub struct WaylandLoop {
     candidate_cache: std::sync::Mutex<Option<CandidateCache>>,
     /// 剪贴板/快捷发送存储。
     clipboard: Arc<ClipboardStore>,
+    /// 剪贴板同步桥命令通道。
+    sync_tx: std::sync::mpsc::Sender<SyncMessage>,
 }
 
 impl WaylandLoop {
@@ -179,6 +182,7 @@ impl WaylandLoop {
         tray: Arc<TrayManager>,
         rt_handle: tokio::runtime::Handle,
         clipboard: Arc<ClipboardStore>,
+        sync_tx: std::sync::mpsc::Sender<SyncMessage>,
     ) -> Self {
         Self {
             command_rx,
@@ -186,6 +190,7 @@ impl WaylandLoop {
             rt_handle,
             candidate_cache: std::sync::Mutex::new(None),
             clipboard,
+            sync_tx,
         }
     }
 
@@ -229,6 +234,10 @@ impl WaylandLoop {
         let mut im_enabled = true;
         // 暗色模式切换后待重绘标记（渲染需在 conn 作用域内进行）
         let mut pending_theme_redraw = false;
+
+        // 剪贴板同步桥初始化：加载 clipboard_sync 插件并拉取一次
+        let _ = self.sync_tx.send(SyncMessage::Reload(scan_descriptors()));
+        let _ = self.sync_tx.send(SyncMessage::Pull);
 
         // 无 launcher 的会话（GNOME 等）：直接连接 $WAYLAND_DISPLAY 使用 v2 协议。
         // KWin 下普通 socket 不暴露 IM 协议，此步会失败，随后等待 launcher 传入 fd。
@@ -306,6 +315,9 @@ impl WaylandLoop {
                 Ok(DaemonCommand::ReloadPlugins) => {
                     debug!("ReloadPlugins command received, reloading plugins...");
                     plugin_host.reload();
+                    // 同步桥：重载 clipboard_sync 插件并立即拉取一次
+                    let _ = self.sync_tx.send(SyncMessage::Reload(scan_descriptors()));
+                    let _ = self.sync_tx.send(SyncMessage::Pull);
                 }
                 Ok(DaemonCommand::SelectSchema(schema_id, result_tx)) => {
                     debug!("SelectSchema command received: {}", schema_id);
@@ -1063,6 +1075,8 @@ impl WaylandLoop {
                             list_panel.open(kind, items);
                             *panel_state = PanelState::ListOpen(kind);
                             self.show_list(c, list_panel, theme, candidate_window_visible);
+                            // 打开剪贴板面板时拉取一次远端（对齐 Android pullOnce 语义）
+                            let _ = self.sync_tx.send(SyncMessage::Pull);
                             debug!("List panel opened from menu: {kind:?}");
                             return;
                         }

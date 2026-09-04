@@ -48,17 +48,30 @@ const MIME_PLAIN: &str = "text/plain";
 /// 单次剪贴板读取上限（1 MiB），防止异常大内容长时间阻塞。
 const MAX_READ_BYTES: u64 = 1024 * 1024;
 
+/// 捕获回调（同步桥等消费方）。
+pub type CapturedCallback = Box<dyn Fn(&str) + Send + Sync>;
+
 /// 启动剪贴板监听后台线程（进程生命周期内常驻）。
 pub fn spawn_watcher(store: Arc<ClipboardStore>) -> JoinHandle<()> {
+    spawn_watcher_with_callback(store, None)
+}
+
+/// 同上，并在每次捕获文本时回调 `on_captured`（剪贴板同步桥等消费方）。
+pub fn spawn_watcher_with_callback(
+    store: Arc<ClipboardStore>,
+    on_captured: Option<CapturedCallback>,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("xime-clipboard-watcher".into())
-        .spawn(move || run_watcher(store))
+        .spawn(move || run_watcher(store, on_captured))
         .expect("spawn clipboard watcher thread")
 }
 
 struct WatcherState {
     store: Arc<ClipboardStore>,
     connection: Connection,
+    /// 捕获回调（剪贴板同步桥），None = 不通知。
+    captured_cb: Option<CapturedCallback>,
     /// 协议对象保活（drop 不销毁协议对象，但保持引用清晰）。
     #[allow(dead_code)]
     ext_manager: Option<ExtDataControlManagerV1>,
@@ -75,7 +88,7 @@ struct WatcherState {
     last_text: Option<String>,
 }
 
-fn run_watcher(store: Arc<ClipboardStore>) {
+fn run_watcher(store: Arc<ClipboardStore>, on_captured: Option<CapturedCallback>) {
     let Ok(connection) = Connection::connect_to_env() else {
         warn!("Clipboard watcher: cannot connect to $WAYLAND_DISPLAY");
         return;
@@ -109,6 +122,7 @@ fn run_watcher(store: Arc<ClipboardStore>) {
         WatcherState {
             store,
             connection,
+            captured_cb: on_captured,
             ext_manager: Some(manager),
             wlr_manager: None,
             ext_device: Some(device),
@@ -123,6 +137,7 @@ fn run_watcher(store: Arc<ClipboardStore>) {
         WatcherState {
             store,
             connection,
+            captured_cb: on_captured,
             ext_manager: None,
             wlr_manager: Some(manager),
             ext_device: None,
@@ -184,6 +199,9 @@ fn capture(state: &mut WatcherState, text: String) {
         return;
     }
     debug!("Clipboard captured: {} chars", text.chars().count());
+    if let Some(cb) = &state.captured_cb {
+        cb(&text);
+    }
     state.last_text = Some(text);
 }
 

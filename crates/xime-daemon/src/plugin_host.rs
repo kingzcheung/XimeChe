@@ -72,8 +72,7 @@ impl PluginHost {
             .map_err(|e| format!("manifest: {e}"))?;
         let dir = manager.plugin_dir(&record.id);
         let config_file = manager.config_path(&record.id);
-        PluginRuntime::load(&dir, &manifest.entry, &config_file)
-            .map_err(|e| format!("runtime: {e}"))
+        PluginRuntime::load(&dir, &manifest, &config_file).map_err(|e| format!("runtime: {e}"))
     }
 
     /// 已加载的 emoji 类插件数量。

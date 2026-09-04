@@ -163,7 +163,13 @@ impl SyncState {
         self.runtimes.clear();
         let mut loaded = 0;
         for d in &descriptors {
-            match PluginRuntime::load(&d.plugin_dir, &d.manifest, &d.config_file) {
+            match PluginRuntime::load_with_apis(
+                &d.plugin_dir,
+                &d.manifest,
+                &d.config_file,
+                xime_plugin::NetworkPolicy::from_manifest(&d.manifest.network),
+                crate::plugin_host::host_apis(&self.store),
+            ) {
                 Ok(runtime) => {
                     runtime.call_on_load();
                     self.runtimes.insert(d.id.clone(), runtime);

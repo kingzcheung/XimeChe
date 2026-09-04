@@ -142,6 +142,22 @@ impl PluginHost {
             .count()
     }
 
+    /// 广播 `text_committed` 下行事件（对齐 Android PluginEventDispatcher）。
+    ///
+    /// 仅 manifest `capabilities.events` 声明了该事件且实现了 `onPluginEvent`
+    /// 的插件会被调用；同步调用，插件网络请求受 host.http 20s 超时约束。
+    pub fn emit_text_committed(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let payload = serde_json::json!({ "text": text });
+        for (id, runtime) in &self.runtimes {
+            if runtime.deliver_event("text_committed", &payload) {
+                debug!("text_committed delivered to '{id}'");
+            }
+        }
+    }
+
     /// 从所有已加载 emoji 插件汇总表情候选。
     pub fn query_emojis(&self, search_text: &str, top_k: usize) -> Vec<EmojiItem> {
         let mut out = Vec::new();

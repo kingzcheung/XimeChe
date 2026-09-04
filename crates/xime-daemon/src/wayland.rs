@@ -608,6 +608,7 @@ impl WaylandLoop {
         if matches!(panel_state, PanelState::ListOpen(_)) && event.pressed {
             if self.handle_list_key(
                 c,
+                plugin_host,
                 list_panel,
                 panel_state,
                 sym,
@@ -709,6 +710,7 @@ impl WaylandLoop {
                 c.commit_string(committed);
                 let _ = c.flush();
                 debug!("Committed: {}", committed);
+                plugin_host.emit_text_committed(committed);
             }
 
             if let Some(ctx) = session.context() {
@@ -847,6 +849,7 @@ impl WaylandLoop {
                     c.commit_string(&text);
                     let _ = c.flush();
                     debug!("Panel committed: {}", text);
+                    plugin_host.emit_text_committed(&text);
                 }
             }
             0x3B => {
@@ -854,6 +857,7 @@ impl WaylandLoop {
                 c.commit_string(";");
                 let _ = c.flush();
                 debug!("Semicolon committed from panel");
+                plugin_host.emit_text_committed(";");
             }
             0xFF09 | 0xFF53 => {
                 // Tab / Right：高亮移动到下一个（页内循环）
@@ -890,6 +894,7 @@ impl WaylandLoop {
                     c.commit_string(&text);
                     let _ = c.flush();
                     debug!("Panel committed by key {}: {}", k, text);
+                    plugin_host.emit_text_committed(&text);
                 }
             }
             k if (0x20..0x7F).contains(&k) => {
@@ -1031,6 +1036,7 @@ impl WaylandLoop {
                         c.commit_string(&text);
                         let _ = c.flush();
                         debug!("Content item committed: {}", text);
+                        plugin_host.emit_text_committed(&text);
                     }
                     return;
                 }
@@ -1204,6 +1210,7 @@ impl WaylandLoop {
                         None => {
                             self.commit_list_item(
                                 c,
+                                plugin_host,
                                 list_panel,
                                 panel_state,
                                 index,
@@ -1304,9 +1311,11 @@ impl WaylandLoop {
     }
 
     /// 提交列表条目：上屏文本 + 标记消费 + 刷新时间戳，面板保持打开。
+    #[allow(clippy::too_many_arguments)]
     fn commit_list_item(
         &self,
         c: &mut dyn ImBackend,
+        plugin_host: &PluginHost,
         list: &mut ListPanel,
         panel_state: &mut PanelState,
         index: usize,
@@ -1323,6 +1332,7 @@ impl WaylandLoop {
             debug!("List item committed: {}", entry.text);
             let _ = self.clipboard.mark_consumed(id);
             let _ = self.clipboard.update_timestamp(id, now_millis());
+            plugin_host.emit_text_committed(&entry.text);
         }
         self.reload_and_show_list(c, list, panel_state, theme, candidate_window_visible);
     }
@@ -1337,6 +1347,7 @@ impl WaylandLoop {
     fn handle_list_key(
         &self,
         c: &mut dyn ImBackend,
+        plugin_host: &PluginHost,
         list: &mut ListPanel,
         panel_state: &mut PanelState,
         sym: Keysym,
@@ -1376,13 +1387,29 @@ impl WaylandLoop {
             0xFF0D | 0xFF8D | 0x20 => {
                 // Return / KP_Enter / Space：提交高亮条目
                 let index = list.highlighted;
-                self.commit_list_item(c, list, panel_state, index, theme, candidate_window_visible);
+                self.commit_list_item(
+                    c,
+                    plugin_host,
+                    list,
+                    panel_state,
+                    index,
+                    theme,
+                    candidate_window_visible,
+                );
                 true
             }
             k if (0x31..=0x35).contains(&k) => {
                 // 数字键 1-5：提交对应行
                 let index = (k - 0x31) as usize;
-                self.commit_list_item(c, list, panel_state, index, theme, candidate_window_visible);
+                self.commit_list_item(
+                    c,
+                    plugin_host,
+                    list,
+                    panel_state,
+                    index,
+                    theme,
+                    candidate_window_visible,
+                );
                 true
             }
             _ => false,

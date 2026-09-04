@@ -19,7 +19,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::protocol::*;
 use wayland_client::{event_created_child, globals::registry_queue_init, Connection, EventQueue};
 use wayland_client::{Dispatch, Proxy, QueueHandle};
-use xime_ui::{CandidateItem, GridItem, IcedSurface, PanelView};
+use xime_ui::{CandidateItem, GridItem, IcedSurface, PanelTheme, PanelView};
 
 pub mod __interfaces {
     use wayland_client::protocol::__interfaces::*;
@@ -708,17 +708,17 @@ impl WaylandConnectionV1 {
         &mut self,
         candidates: &[CandidateItem],
         highlighted_index: usize,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) -> Result<()> {
-        // 面板展开视图决定增高与宽度
+        // 面板展开视图决定增高与宽度（候选栏高度随主题字号自适应）
         let panel_view = self.state.panel_view.clone();
         let panel_height = xime_ui::panel_height_for(&panel_view);
-        let height = 36u32 + panel_height;
+        let height = theme.bar_height() + panel_height;
 
         // Take surface out of self for width measurement and drawing
         let mut surface = self.renderer.take().unwrap_or_default();
         // measure_candidates 已包含右侧菜单按钮宽度
-        let measured = surface.measure_candidates(candidates);
+        let measured = surface.measure_candidates(candidates, theme);
         // 内容网格按最宽项自适应列宽/列数，宽度不低于候选栏
         let width = match &panel_view {
             PanelView::Content { items, .. } => {
@@ -783,7 +783,7 @@ impl WaylandConnectionV1 {
             height,
             candidates,
             highlighted_index,
-            primary_color,
+            theme,
             &panel_view,
         );
 
@@ -806,7 +806,7 @@ impl WaylandConnectionV1 {
         );
         self.current_buffer = Some(buffer.clone());
 
-        // 候选栏（buffer 顶部 36px）锚定光标，菜单面板在其下方展开。
+        // 候选栏（buffer 顶部候选栏高度）锚定光标，菜单面板在其下方展开。
         surface_obj.attach(Some(&buffer), 0, 0);
         surface_obj.damage_buffer(0, 0, width as i32, height as i32);
         surface_obj.commit();
@@ -822,19 +822,15 @@ impl WaylandConnectionV1 {
     }
 
     /// 候选栏自然宽度（内容 + 菜单按钮），用于命中测试。
-    pub fn candidate_width(&mut self, candidates: &[CandidateItem]) -> u32 {
+    pub fn candidate_width(&mut self, candidates: &[CandidateItem], theme: &PanelTheme) -> u32 {
         let mut surface = self.renderer.take().unwrap_or_default();
-        let width = surface.measure_candidates(candidates);
+        let width = surface.measure_candidates(candidates, theme);
         self.renderer = Some(surface);
         width
     }
 
     /// 打开菜单：仅设置状态（候选栏增高由下一次 show_candidate_window 渲染）。
-    pub fn show_menu_panel(
-        &mut self,
-        active_index: Option<usize>,
-        _primary_color: (u8, u8, u8),
-    ) -> Result<()> {
+    pub fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<()> {
         self.state.panel_view = PanelView::Menu(active_index);
         debug!("Menu panel flag set (rendered on next candidate refresh)");
         Ok(())
@@ -861,15 +857,10 @@ impl WaylandConnectionV1 {
 
     /// Show a single key root display window
     /// Displays "a: 工匚戈艹廿龷七弋戈" in a small popup
-    pub fn show_root_window(
-        &mut self,
-        key: char,
-        root: &str,
-        primary_color: (u8, u8, u8),
-    ) -> Result<()> {
+    pub fn show_root_window(&mut self, key: char, root: &str, theme: &PanelTheme) -> Result<()> {
         let mut surface = self.renderer.take().unwrap_or_default();
-        let width = surface.measure_root(key, root);
-        let height = 36;
+        let width = surface.measure_root(key, root, theme);
+        let height = theme.bar_height();
 
         // Use candidate_surface to display root (same surface, different content)
         let shm = self.shm.clone().ok_or(Error::NoShm)?;
@@ -895,7 +886,7 @@ impl WaylandConnectionV1 {
         let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, self.state.clone());
         self.current_pool = Some(pool.clone());
 
-        self.draw_root(&fd, width, height, key, root, primary_color, &mut surface)?;
+        self.draw_root(&fd, width, height, key, root, theme, &mut surface)?;
         self.renderer = Some(surface);
 
         let buffer = pool.create_buffer(
@@ -932,7 +923,7 @@ impl WaylandConnectionV1 {
         height: u32,
         key: char,
         root: &str,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
         surface: &mut IcedSurface,
     ) -> Result<()> {
         let size = (width * height * 4) as usize;
@@ -952,7 +943,7 @@ impl WaylandConnectionV1 {
 
         let pixels: &mut [u8] = unsafe { slice::from_raw_parts_mut(ptr.as_ptr() as *mut u8, size) };
 
-        surface.draw_root(pixels, width, height, key, root, primary_color);
+        surface.draw_root(pixels, width, height, key, root, theme);
 
         unsafe {
             nix::sys::mman::munmap(ptr, size)

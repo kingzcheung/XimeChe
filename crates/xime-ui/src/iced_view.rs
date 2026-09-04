@@ -2,6 +2,7 @@
 //!
 //! 用 iced 的 widget 树（Element）描述 UI，经 `iced_tiny_skia`
 //! 离屏渲染到 SHM buffer。布局/圆角/文本/图标交给 iced，避免手绘。
+//! 样式来自 [`PanelTheme`]（配置 + 亮/暗模式），不再硬编码。
 
 use iced_tiny_skia::core::widget::tree::Tree;
 use iced_tiny_skia::core::Renderer as CoreRenderer;
@@ -14,23 +15,17 @@ use iced_widget::{container, row, text, Space, Svg};
 type Pixmap = tiny_skia11::Pixmap;
 type Mask = tiny_skia11::Mask;
 
+use crate::theme::PanelTheme;
 use crate::CandidateItem;
 use crate::{
     content_cell_width, content_columns_for, content_text_width, GridItem, MenuAction, PanelView,
-    CANDIDATE_HEIGHT, CONTENT_GAP, CONTENT_ITEM_SIZE, CONTENT_ROWS, MENU_BUTTON_WIDTH,
-    MENU_COLUMNS, MENU_ITEM_HEIGHT,
+    CONTENT_GAP, CONTENT_ITEM_SIZE, CONTENT_ROWS, MENU_BUTTON_WIDTH, MENU_COLUMNS,
+    MENU_ITEM_HEIGHT,
 };
 
 const MENU_SVG: &[u8] = include_bytes!("../resources/menu.svg");
 
-const BG: Color = Color::from_rgb8(0xFA, 0xFA, 0xFA);
-const BORDER: Color = Color::from_rgb8(0xE0, 0xE0, 0xE0);
-const TEXT_MAIN: Color = Color::from_rgb8(0x33, 0x33, 0x33);
-const TEXT_COMMENT: Color = Color::from_rgb8(0xB0, 0xB0, 0xB0);
-const CONTAINER_RADIUS: f32 = 6.0;
-const HIGHLIGHT_RADIUS: f32 = 6.0;
-
-/// 菜单入口图标颜色。
+/// 菜单入口图标颜色（固定点缀色，不随主题变化）。
 fn menu_item_color(idx: usize) -> Color {
     match idx {
         0 => Color::from_rgb8(0x8F, 0x73, 0xE2),
@@ -140,8 +135,8 @@ impl IcedSurface {
     }
 
     /// 候选栏自然宽度（内容 + 菜单按钮）。
-    pub fn measure_candidates(&mut self, candidates: &[CandidateItem]) -> u32 {
-        let mut view = candidate_bar_view(candidates, 0, (0x8F, 0x73, 0xE2));
+    pub fn measure_candidates(&mut self, candidates: &[CandidateItem], theme: &PanelTheme) -> u32 {
+        let mut view = candidate_bar_view(candidates, 0, theme);
         let size = self.measure(&mut view);
         size.width.ceil() as u32
     }
@@ -154,7 +149,7 @@ impl IcedSurface {
         height: u32,
         candidates: &[CandidateItem],
         highlighted_index: usize,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) {
         self.draw_panel(
             pixels,
@@ -162,7 +157,7 @@ impl IcedSurface {
             height,
             candidates,
             highlighted_index,
-            primary_color,
+            theme,
             &PanelView::Closed,
         );
     }
@@ -176,15 +171,23 @@ impl IcedSurface {
         height: u32,
         candidates: &[CandidateItem],
         highlighted_index: usize,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
         panel_view: &PanelView,
     ) {
         // 1. 自绘圆角背景 + 边框（SDF 精确，绕开 tiny-skia 曲线光栅化偏差）
-        paint_rounded_panel(pixels, width, height, CONTAINER_RADIUS, 2.0, BORDER, BG);
+        paint_rounded_panel(
+            pixels,
+            width,
+            height,
+            theme.corner_radius,
+            2.0,
+            theme.border,
+            theme.bg,
+        );
 
         // 2. iced 渲染内容（透明背景）到临时 buffer
         let mut content = vec![0u8; (width * height * 4) as usize];
-        let mut view = build_panel_view(candidates, highlighted_index, primary_color, panel_view);
+        let mut view = build_panel_view(candidates, highlighted_index, theme, panel_view);
         self.render(&mut view, &mut content, width, height);
 
         // 3. 内容合成到背景
@@ -192,8 +195,8 @@ impl IcedSurface {
     }
 
     /// 字根窗口自然宽度。
-    pub fn measure_root(&mut self, key: char, root: &str) -> u32 {
-        let mut view = root_view(key, root, (0x8F, 0x73, 0xE2));
+    pub fn measure_root(&mut self, key: char, root: &str, theme: &PanelTheme) -> u32 {
+        let mut view = root_view(key, root, theme);
         let size = self.measure(&mut view);
         size.width.ceil() as u32
     }
@@ -206,14 +209,22 @@ impl IcedSurface {
         height: u32,
         key: char,
         root: &str,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) {
         // 1. 自绘圆角背景 + 边框（SDF 精确）
-        paint_rounded_panel(pixels, width, height, CONTAINER_RADIUS, 2.0, BORDER, BG);
+        paint_rounded_panel(
+            pixels,
+            width,
+            height,
+            theme.corner_radius,
+            2.0,
+            theme.border,
+            theme.bg,
+        );
 
         // 2. iced 渲染内容（透明背景）到临时 buffer
         let mut content = vec![0u8; (width * height * 4) as usize];
-        let mut view = root_view(key, root, primary_color);
+        let mut view = root_view(key, root, theme);
         self.render(&mut view, &mut content, width, height);
 
         // 3. 内容合成到背景
@@ -321,36 +332,39 @@ fn blend_over(dst: &mut [u8], src: &[u8]) {
 fn candidate_items<'a>(
     candidates: &'a [CandidateItem],
     highlighted_index: usize,
-    primary_color: (u8, u8, u8),
+    theme: &'a PanelTheme,
 ) -> Element<'a, (), Theme, Renderer> {
     let mut content = row![].spacing(6);
+    let comment_size = (theme.font_size - 2.0).max(10.0);
     for (idx, candidate) in candidates.iter().enumerate() {
         let is_hl = idx == highlighted_index;
         let label = format!("{}. {}", idx + 1, candidate.text);
-        let t = text(label)
-            .size(16)
-            .color(if is_hl { Color::WHITE } else { TEXT_MAIN });
-        let comment = if !candidate.comment.is_empty() {
-            text(candidate.comment.clone()).size(12).color(TEXT_COMMENT)
+        let t = text(label).size(theme.font_size).color(if is_hl {
+            Color::WHITE
         } else {
-            text("").size(12)
+            theme.text_main
+        });
+        let comment = if !candidate.comment.is_empty() {
+            text(candidate.comment.clone())
+                .size(comment_size)
+                .color(theme.text_comment)
+        } else {
+            text("").size(comment_size)
         };
         let item = row![t, comment]
             .spacing(4)
             .align_y(iced_widget::core::alignment::Vertical::Center);
 
+        let radius = theme.highlight_radius();
         if is_hl {
-            let (r, g, b) = primary_color;
             content =
                 content.push(
                     container(item)
                         .padding([4, 8])
                         .style(move |_| container::Style {
-                            background: Some(iced_widget::core::Background::Color(
-                                Color::from_rgb8(r, g, b),
-                            )),
+                            background: Some(iced_widget::core::Background::Color(theme.primary)),
                             border: iced_widget::core::border::Border {
-                                radius: iced_widget::core::border::Radius::from(HIGHLIGHT_RADIUS),
+                                radius: iced_widget::core::border::Radius::from(radius),
                                 ..Default::default()
                             },
                             ..Default::default()
@@ -371,30 +385,35 @@ fn candidate_items<'a>(
 fn candidate_bar_view<'a>(
     candidates: &'a [CandidateItem],
     highlighted_index: usize,
-    primary_color: (u8, u8, u8),
+    theme: &'a PanelTheme,
 ) -> Element<'a, (), Theme, Renderer> {
     container(row![
-        candidate_items(candidates, highlighted_index, primary_color),
-        menu_button(false),
+        candidate_items(candidates, highlighted_index, theme),
+        menu_button(false, theme),
     ])
     .padding([0, 12])
     .into()
 }
 
 /// 菜单按钮（九宫格 SVG 图标，active 时高亮）。
-fn menu_button(active: bool) -> Element<'static, (), Theme, Renderer> {
+fn menu_button(active: bool, theme: &PanelTheme) -> Element<'static, (), Theme, Renderer> {
     let icon = Svg::new(iced_widget::core::svg::Handle::from_memory(MENU_SVG))
         .width(32)
         .height(32);
+    let (r, g, b) = (
+        (theme.primary.r * 255.0) as u8,
+        (theme.primary.g * 255.0) as u8,
+        (theme.primary.b * 255.0) as u8,
+    );
     container(icon)
         .width(MENU_BUTTON_WIDTH)
-        .height(CANDIDATE_HEIGHT)
+        .height(theme.bar_height())
         .align_x(iced_widget::core::alignment::Horizontal::Center)
         .align_y(iced_widget::core::alignment::Vertical::Center)
         .style(move |_| container::Style {
             background: if active {
                 Some(iced_widget::core::Background::Color(Color::from_rgba8(
-                    0x8F, 0x73, 0xE2, 0.13,
+                    r, g, b, 0.13,
                 )))
             } else {
                 None
@@ -408,20 +427,20 @@ fn menu_button(active: bool) -> Element<'static, (), Theme, Renderer> {
 fn build_panel_view<'a>(
     candidates: &'a [CandidateItem],
     highlighted_index: usize,
-    primary_color: (u8, u8, u8),
+    theme: &'a PanelTheme,
     view: &'a PanelView,
 ) -> Element<'a, (), Theme, Renderer> {
-    let bar = candidate_bar(candidates, highlighted_index, primary_color);
+    let bar = candidate_bar(candidates, highlighted_index, theme);
     let content: Element<'a, (), Theme, Renderer> = match view {
         PanelView::Closed => bar,
         PanelView::Menu(active_index) => {
-            let grid = menu_grid(*active_index);
-            let divider = panel_divider();
+            let grid = menu_grid(*active_index, theme);
+            let divider = panel_divider(theme);
             iced_widget::column![bar, divider, grid].into()
         }
         PanelView::Content { items, highlighted } => {
-            let grid = content_grid(items, *highlighted);
-            let divider = panel_divider();
+            let grid = content_grid(items, *highlighted, theme);
+            let divider = panel_divider(theme);
             iced_widget::column![bar, divider, grid].into()
         }
     };
@@ -435,12 +454,12 @@ fn build_panel_view<'a>(
 }
 
 /// 面板区与候选栏之间的分隔线。
-fn panel_divider<'a>() -> Element<'a, (), Theme, Renderer> {
+fn panel_divider<'a>(theme: &'a PanelTheme) -> Element<'a, (), Theme, Renderer> {
     container(Space::new())
         .width(iced_widget::core::Length::Fill)
         .height(1)
-        .style(|_| container::Style {
-            background: Some(iced_widget::core::Background::Color(BORDER)),
+        .style(move |_| container::Style {
+            background: Some(iced_widget::core::Background::Color(theme.border)),
             ..Default::default()
         })
         .into()
@@ -450,32 +469,35 @@ fn panel_divider<'a>() -> Element<'a, (), Theme, Renderer> {
 fn candidate_bar<'a>(
     candidates: &'a [CandidateItem],
     highlighted_index: usize,
-    primary_color: (u8, u8, u8),
+    theme: &'a PanelTheme,
 ) -> Element<'a, (), Theme, Renderer> {
     container(
         row![
-            candidate_items(candidates, highlighted_index, primary_color),
+            candidate_items(candidates, highlighted_index, theme),
             Space::new().width(iced_widget::core::Length::Fill),
-            menu_button(false),
+            menu_button(false, theme),
         ]
         .align_y(iced_widget::core::alignment::Vertical::Center),
     )
     .width(iced_widget::core::Length::Fill)
-    .height(CANDIDATE_HEIGHT)
+    .height(theme.bar_height())
     .padding([0, 12])
     .align_y(iced_widget::core::alignment::Vertical::Center)
     .into()
 }
 
 /// 菜单双列网格（2 行 × 2 列）。
-fn menu_grid(active_index: Option<usize>) -> Element<'static, (), Theme, Renderer> {
+fn menu_grid(
+    active_index: Option<usize>,
+    theme: &PanelTheme,
+) -> Element<'static, (), Theme, Renderer> {
     let mut grid = iced_widget::column![].spacing(0);
     for r in 0..(MenuAction::ALL.len() / MENU_COLUMNS) {
         let mut row_widget = iced_widget::row![].spacing(0);
         for c in 0..MENU_COLUMNS {
             let idx = r * MENU_COLUMNS + c;
             let cell: Element<'static, (), Theme, Renderer> = match MenuAction::ALL.get(idx) {
-                Some(action) => menu_cell(*action, active_index == Some(idx)),
+                Some(action) => menu_cell(*action, active_index == Some(idx), theme),
                 None => Space::new()
                     .width(iced_widget::core::Length::Fill)
                     .height(MENU_ITEM_HEIGHT)
@@ -496,17 +518,25 @@ fn menu_grid(active_index: Option<usize>) -> Element<'static, (), Theme, Rendere
 
 /// 单个菜单入口：图标 chip（首字 + 色底）+ 文字。
 /// 未实现的入口（is_available() == false）置灰显示，点击无效。
-fn menu_cell(action: MenuAction, active: bool) -> Element<'static, (), Theme, Renderer> {
+fn menu_cell(
+    action: MenuAction,
+    active: bool,
+    theme: &PanelTheme,
+) -> Element<'static, (), Theme, Renderer> {
     let idx = action.index();
     let available = action.is_available();
     let color = if available {
         menu_item_color(idx)
     } else {
-        Color::from_rgb8(0xC0, 0xC0, 0xC0)
+        theme.text_comment
     };
-    let label_color = if available { TEXT_MAIN } else { TEXT_COMMENT };
+    let label_color = if available {
+        theme.text_main
+    } else {
+        theme.text_comment
+    };
     let first = action.label().chars().next().unwrap_or('?');
-    let chip = container(text(first.to_string()).size(14).color(color))
+    let chip = container(text(first.to_string()).size(theme.font_size).color(color))
         .width(32)
         .height(32)
         .align_x(iced_widget::core::alignment::Horizontal::Center)
@@ -524,11 +554,18 @@ fn menu_cell(action: MenuAction, active: bool) -> Element<'static, (), Theme, Re
             },
             ..Default::default()
         });
-    let label = text(action.label()).size(14).color(label_color);
+    let label = text(action.label())
+        .size(theme.font_size)
+        .color(label_color);
     let item = row![chip, label]
         .spacing(10)
         .align_y(iced_widget::core::alignment::Vertical::Center);
 
+    let (pr, pg, pb) = (
+        (theme.primary.r * 255.0) as u8,
+        (theme.primary.g * 255.0) as u8,
+        (theme.primary.b * 255.0) as u8,
+    );
     container(item)
         .width(iced_widget::core::Length::Fill)
         .height(MENU_ITEM_HEIGHT)
@@ -537,7 +574,7 @@ fn menu_cell(action: MenuAction, active: bool) -> Element<'static, (), Theme, Re
         .style(move |_| container::Style {
             background: if active {
                 Some(iced_widget::core::Background::Color(Color::from_rgba8(
-                    0x8F, 0x73, 0xE2, 0.05,
+                    pr, pg, pb, 0.05,
                 )))
             } else {
                 None
@@ -549,9 +586,13 @@ fn menu_cell(action: MenuAction, active: bool) -> Element<'static, (), Theme, Re
 
 /// 内容网格（表情/符号）：列数按最宽项自适应（4..=10），固定 CONTENT_ROWS 行，
 /// 空位留白，高亮项着色。
+///
+/// 字号固定 16：`menu.rs::content_text_width` 的宽度估算以 16px 为基准，
+/// 同时驱动渲染与点击命中几何，改动会破坏两者一致性。
 fn content_grid(
     items: &[GridItem],
     highlighted: Option<usize>,
+    theme: &PanelTheme,
 ) -> Element<'static, (), Theme, Renderer> {
     let widest = items
         .iter()
@@ -566,7 +607,7 @@ fn content_grid(
         for c in 0..columns {
             let idx = r * columns + c;
             let cell: Element<'static, (), Theme, Renderer> = match items.get(idx) {
-                Some(item) => content_cell(item, highlighted == Some(idx)),
+                Some(item) => content_cell(item, highlighted == Some(idx), theme),
                 None => Space::new()
                     .width(iced_widget::core::Length::Fill)
                     .height(CONTENT_ITEM_SIZE)
@@ -586,11 +627,20 @@ fn content_grid(
 }
 
 /// 单个内容单元格：文本居中不换行，高亮时着底色。
-fn content_cell(item: &GridItem, highlighted: bool) -> Element<'static, (), Theme, Renderer> {
+fn content_cell(
+    item: &GridItem,
+    highlighted: bool,
+    theme: &PanelTheme,
+) -> Element<'static, (), Theme, Renderer> {
+    let (pr, pg, pb) = (
+        (theme.primary.r * 255.0) as u8,
+        (theme.primary.g * 255.0) as u8,
+        (theme.primary.b * 255.0) as u8,
+    );
     container(
         text(item.text.clone())
             .size(16)
-            .color(TEXT_MAIN)
+            .color(theme.text_main)
             .wrapping(iced_widget::core::text::Wrapping::None),
     )
     .width(iced_widget::core::Length::Fill)
@@ -600,7 +650,7 @@ fn content_cell(item: &GridItem, highlighted: bool) -> Element<'static, (), Them
     .style(move |_| container::Style {
         background: if highlighted {
             Some(iced_widget::core::Background::Color(Color::from_rgba8(
-                0x8F, 0x73, 0xE2, 0.13,
+                pr, pg, pb, 0.13,
             )))
         } else {
             None
@@ -614,25 +664,28 @@ fn content_cell(item: &GridItem, highlighted: bool) -> Element<'static, (), Them
 fn root_view<'a>(
     key: char,
     root: &'a str,
-    primary_color: (u8, u8, u8),
+    theme: &'a PanelTheme,
 ) -> Element<'a, (), Theme, Renderer> {
-    let (r, g, b) = primary_color;
-    let key_box = container(text(key.to_string()).size(20).color(Color::WHITE))
-        .width(32)
-        .height(32)
-        .align_x(iced_widget::core::alignment::Horizontal::Center)
-        .align_y(iced_widget::core::alignment::Vertical::Center)
-        .style(move |_| container::Style {
-            background: Some(iced_widget::core::Background::Color(Color::from_rgb8(
-                r, g, b,
-            ))),
-            border: iced_widget::core::border::Border {
-                radius: iced_widget::core::border::Radius::from(4.0),
-                ..Default::default()
-            },
+    let key_box = container(
+        text(key.to_string())
+            .size(theme.font_size + 6.0)
+            .color(Color::WHITE),
+    )
+    .width(32)
+    .height(32)
+    .align_x(iced_widget::core::alignment::Horizontal::Center)
+    .align_y(iced_widget::core::alignment::Vertical::Center)
+    .style(move |_| container::Style {
+        background: Some(iced_widget::core::Background::Color(theme.primary)),
+        border: iced_widget::core::border::Border {
+            radius: iced_widget::core::border::Radius::from(4.0),
             ..Default::default()
-        });
-    let root_text = text(root.to_string()).size(16).color(TEXT_MAIN);
+        },
+        ..Default::default()
+    });
+    let root_text = text(root.to_string())
+        .size(theme.font_size + 2.0)
+        .color(theme.text_main);
     // 背景圆角/边框由 paint_rounded_panel 自绘（SDF 精确），这里透明
     container(
         row![key_box, root_text]
@@ -672,12 +725,17 @@ mod tests {
         ]
     }
 
+    fn test_theme() -> PanelTheme {
+        PanelTheme::light(16.0, 6.0, (0x8F, 0x73, 0xE2))
+    }
+
     /// 测量宽度应合理（内容自适应，不会撑满极限尺寸）。
     #[test]
     fn test_measure_candidates_width_reasonable() {
         let candidates = sample_candidates();
+        let theme = test_theme();
         let mut surface = IcedSurface::new();
-        let w = surface.measure_candidates(&candidates);
+        let w = surface.measure_candidates(&candidates, &theme);
         assert!(
             (80..=800).contains(&w),
             "candidate width should be reasonable, got: {}",
@@ -689,11 +747,12 @@ mod tests {
     #[test]
     fn test_panel_corners_rounded() {
         let candidates = sample_candidates();
+        let theme = test_theme();
         let mut surface = IcedSurface::new();
-        let w = surface.measure_candidates(&candidates);
-        let h = 36u32;
+        let w = surface.measure_candidates(&candidates, &theme);
+        let h = theme.bar_height();
         let mut pixels = vec![0u8; (w * h * 4) as usize];
-        surface.draw_candidates(&mut pixels, w, h, &candidates, 0, (0x8F, 0x73, 0xE2));
+        surface.draw_candidates(&mut pixels, w, h, &candidates, 0, &theme);
 
         // 角部 1px 内应透明（圆角），检查 (0,0) 与 (w-1, h-1)
         let at = |x: u32, y: u32| pixels[((y * w + x) * 4 + 3) as usize];
@@ -714,9 +773,10 @@ mod tests {
     #[test]
     fn test_repeated_draw_no_icon_doubling() {
         let candidates = sample_candidates();
+        let theme = test_theme();
         let mut surface = IcedSurface::new();
-        let w = surface.measure_candidates(&candidates);
-        let h = crate::expanded_height();
+        let w = surface.measure_candidates(&candidates, &theme);
+        let h = theme.bar_height() + crate::menu_panel_height();
 
         let mut frames: Vec<Vec<u8>> = Vec::new();
         for _ in 0..3 {
@@ -727,7 +787,7 @@ mod tests {
                 h,
                 &candidates,
                 0,
-                (0x8F, 0x73, 0xE2),
+                &theme,
                 &crate::PanelView::Menu(None),
             );
             frames.push(pixels);
@@ -756,5 +816,19 @@ mod tests {
             "frames differ: {} px, bbox x:[{},{}] y:[{},{}]",
             count, minx, maxx, miny, maxy
         );
+    }
+
+    /// 亮/暗主题渲染都应正常完成（暗色背景非透明）。
+    #[test]
+    fn test_dark_theme_renders() {
+        let candidates = sample_candidates();
+        let theme = PanelTheme::dark(16.0, 6.0, (0x8F, 0x73, 0xE2));
+        let mut surface = IcedSurface::new();
+        let w = surface.measure_candidates(&candidates, &theme);
+        let h = theme.bar_height();
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        surface.draw_candidates(&mut pixels, w, h, &candidates, 0, &theme);
+        let at = |x: u32, y: u32| pixels[((y * w + x) * 4 + 3) as usize];
+        assert!(at(w / 2, 1) != 0, "dark theme should paint background");
     }
 }

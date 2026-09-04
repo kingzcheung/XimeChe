@@ -5750,6 +5750,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-lite",
  "librime",
  "nix 0.31.3",
  "serde",

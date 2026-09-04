@@ -6,6 +6,7 @@ use tracing::{debug, error, info};
 use xime_config::XimeConfig;
 use xime_plugin::EmojiItem;
 use xime_tray::{InputMode, TrayManager};
+use xime_ui::PanelTheme;
 use xime_wayland::{connect_im_from_fd, connect_im_to_env, ImBackend};
 use xime_xkb::XkbContext;
 use xime_xkb::{keysym_to_letter, Keysym, ModifierState};
@@ -107,6 +108,16 @@ fn emoji_select_index(keysym: u32) -> Option<usize> {
     }
 }
 
+/// 从配置构建渲染主题（亮/暗模式 + 字号/圆角/高亮色）。
+fn build_theme(config: &XimeConfig, dark: bool) -> PanelTheme {
+    PanelTheme::for_mode(
+        dark,
+        config.style.font_size,
+        config.style.corner_radius,
+        config.get_primary_color(),
+    )
+}
+
 /// 页内索引 → 实际提交文本（无保留位，索引 0 即当前页第一个）。
 fn panel_commit_text(panel: &SearchPanel, index: usize) -> Option<String> {
     let offset = panel.page * panel.per_page();
@@ -127,8 +138,8 @@ fn should_forward_key(
     !press_consumed && !release_of_consumed
 }
 
-/// 最近一次候选窗内容（菜单开/关后重绘用）。
-type CandidateCache = (Vec<xime_ui::CandidateItem>, usize, (u8, u8, u8));
+/// 最近一次候选窗内容（菜单开/关后重绘用，主题以当前值为准）。
+type CandidateCache = (Vec<xime_ui::CandidateItem>, usize);
 
 pub struct WaylandLoop {
     command_rx: Receiver<DaemonCommand>,
@@ -165,6 +176,9 @@ impl WaylandLoop {
         self.rt_handle.block_on(async {
             self.tray.set_primary_color(primary_color).await;
         });
+        // 渲染主题：配置样式 + 亮/暗模式（暗色由 portal 监听任务推送）。
+        let mut dark_mode = false;
+        let mut theme = build_theme(&xime_config, dark_mode);
         debug!(
             "Loaded hotkeys: show_key={}, primary_color={:?}",
             xime_config.wubi_radicals.hotkeys.show_key, primary_color
@@ -181,6 +195,8 @@ impl WaylandLoop {
         let mut last_active = false;
         // 输入法启停开关（Ctrl+Space 切换）：停用态按键直接转发，不做任何处理。
         let mut im_enabled = true;
+        // 暗色模式切换后待重绘标记（渲染需在 conn 作用域内进行）
+        let mut pending_theme_redraw = false;
 
         // 无 launcher 的会话（GNOME 等）：直接连接 $WAYLAND_DISPLAY 使用 v2 协议。
         // KWin 下普通 socket 不暴露 IM 协议，此步会失败，随后等待 launcher 传入 fd。
@@ -244,8 +260,16 @@ impl WaylandLoop {
                         self.tray.set_primary_color(new_color).await;
                     });
                     xime_config = new_config;
+                    theme = build_theme(&xime_config, dark_mode);
 
                     debug!("Style config reloaded, new primary_color={:?}", new_color);
+                }
+                Ok(DaemonCommand::DarkMode(dark)) => {
+                    debug!("DarkMode command received: dark={}", dark);
+                    dark_mode = dark;
+                    theme = build_theme(&xime_config, dark_mode);
+                    // 候选栏可见时标记重绘（渲染需在 conn 作用域内进行）
+                    pending_theme_redraw = true;
                 }
                 Ok(DaemonCommand::ReloadPlugins) => {
                     debug!("ReloadPlugins command received, reloading plugins...");
@@ -322,6 +346,7 @@ impl WaylandLoop {
                         &mut panel_state,
                         &mut last_panel_width,
                         &xime_config,
+                        &theme,
                         &mut candidate_window_visible,
                         &mut consumed_presses,
                         &mut last_input_keysym,
@@ -330,6 +355,20 @@ impl WaylandLoop {
                         &mut im_enabled,
                     );
                 }
+
+                // 主题切换后的候选栏重绘（仅候选栏可见且面板未展开时）
+                if pending_theme_redraw {
+                    pending_theme_redraw = false;
+                    if candidate_window_visible && matches!(panel_state, PanelState::Closed) {
+                        self.redraw_menu_candidates(
+                            c.as_mut(),
+                            &theme,
+                            &mut candidate_window_visible,
+                        );
+                    }
+                }
+            } else {
+                pending_theme_redraw = false;
             }
 
             thread::sleep(std::time::Duration::from_millis(1));
@@ -347,6 +386,7 @@ impl WaylandLoop {
         panel_state: &mut PanelState,
         last_panel_width: &mut u32,
         xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
         consumed_presses: &mut std::collections::HashSet<u32>,
         last_input_keysym: &mut Option<u32>,
@@ -381,7 +421,7 @@ impl WaylandLoop {
                 search_panel,
                 panel_state,
                 last_panel_width,
-                xime_config,
+                theme,
                 candidate_window_visible,
                 &pe,
             );
@@ -406,6 +446,7 @@ impl WaylandLoop {
                         panel_state,
                         last_panel_width,
                         xime_config,
+                        theme,
                         event,
                         sym,
                         candidate_window_visible,
@@ -431,6 +472,7 @@ impl WaylandLoop {
         panel_state: &mut PanelState,
         last_panel_width: &mut u32,
         xime_config: &XimeConfig,
+        theme: &PanelTheme,
         event: xime_wayland::KeyEvent,
         sym: Keysym,
         candidate_window_visible: &mut bool,
@@ -507,7 +549,7 @@ impl WaylandLoop {
             debug!("Key pressed while menu open, closing panel");
             *panel_state = PanelState::Closed;
             c.hide_menu_panel();
-            self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+            self.redraw_menu_candidates(c, theme, candidate_window_visible);
             // 不转发：面板关闭后由后续按键处理正常输入
         }
 
@@ -519,7 +561,7 @@ impl WaylandLoop {
             panel_state,
             &event,
             sym,
-            xime_config,
+            theme,
             candidate_window_visible,
         ) {
             return;
@@ -530,6 +572,7 @@ impl WaylandLoop {
             && self.handle_ctrl_key(
                 c,
                 xime_config,
+                theme,
                 &event,
                 sym,
                 modifiers,
@@ -605,9 +648,12 @@ impl WaylandLoop {
 
                 let menu = ctx.menu();
                 if menu.num_candidates > 0 {
-                    let candidate_items: Vec<xime_ui::CandidateItem> = menu
+                    // candidate_count 配置限制展示条数（对齐 macOS 版 max_candidates）
+                    let max_candidates = xime_config.style.candidate_count.clamp(1, 9) as usize;
+                    let mut candidate_items: Vec<xime_ui::CandidateItem> = menu
                         .candidates
                         .iter()
+                        .take(max_candidates)
                         .enumerate()
                         .map(|(i, x)| {
                             let comment = x.comment.map(|c| c.to_string()).unwrap_or_default();
@@ -619,18 +665,22 @@ impl WaylandLoop {
                             }
                         })
                         .collect();
-                    let highlighted_index = menu.highlighted_candidate_index;
+                    // 截断后重排索引（高亮索引在展示范围内不变）
+                    for (i, item) in candidate_items.iter_mut().enumerate() {
+                        item.index = i;
+                    }
+                    let highlighted_index =
+                        menu.highlighted_candidate_index.min(max_candidates - 1);
                     debug!("highlighted_index={}", highlighted_index);
-                    let primary_color = xime_config.get_primary_color();
                     if let Err(e) =
-                        c.show_candidate_window(&candidate_items, highlighted_index, primary_color)
+                        c.show_candidate_window(&candidate_items, highlighted_index, theme)
                     {
                         debug!("Candidate window error: {}", e);
                     }
-                    *last_panel_width = c.candidate_width(&candidate_items);
+                    *last_panel_width = c.candidate_width(&candidate_items, theme);
                     // 缓存最近候选（菜单开/关后重绘）
                     if let Ok(mut cache) = self.candidate_cache.lock() {
-                        *cache = Some((candidate_items.clone(), highlighted_index, primary_color));
+                        *cache = Some((candidate_items.clone(), highlighted_index));
                     }
                     *candidate_window_visible = true;
                 } else if *candidate_window_visible {
@@ -663,7 +713,7 @@ impl WaylandLoop {
         panel_state: &mut PanelState,
         event: &xime_wayland::KeyEvent,
         sym: Keysym,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) -> bool {
         if !event.pressed {
@@ -688,7 +738,7 @@ impl WaylandLoop {
                     plugin_host,
                     panel,
                     panel_state,
-                    xime_config,
+                    theme,
                     candidate_window_visible,
                 );
                 debug!("Emoji panel activated");
@@ -703,7 +753,7 @@ impl WaylandLoop {
                 panel.active = false;
                 *panel_state = PanelState::Closed;
                 c.hide_menu_panel();
-                self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                self.redraw_menu_candidates(c, theme, candidate_window_visible);
                 debug!("Search panel exited via Escape");
             }
             0xFF08 => {
@@ -714,7 +764,7 @@ impl WaylandLoop {
                     plugin_host,
                     panel,
                     panel_state,
-                    xime_config,
+                    theme,
                     candidate_window_visible,
                 );
             }
@@ -736,20 +786,20 @@ impl WaylandLoop {
                 // Tab / Right：高亮移动到下一个（页内循环）
                 let count = panel.page_len().max(1);
                 panel.highlighted = (panel.highlighted + 1) % count;
-                self.show_content(c, panel, xime_config, candidate_window_visible);
+                self.show_content(c, panel, theme, candidate_window_visible);
             }
             0xFF51 => {
                 // Left：高亮移动到上一个
                 let count = panel.page_len().max(1);
                 panel.highlighted = (panel.highlighted + count - 1) % count;
-                self.show_content(c, panel, xime_config, candidate_window_visible);
+                self.show_content(c, panel, theme, candidate_window_visible);
             }
             0xFF52 => {
                 // Up：上一页
                 if panel.page > 0 {
                     panel.page -= 1;
                     panel.highlighted = 0;
-                    self.show_content(c, panel, xime_config, candidate_window_visible);
+                    self.show_content(c, panel, theme, candidate_window_visible);
                 }
             }
             0xFF54 => {
@@ -757,7 +807,7 @@ impl WaylandLoop {
                 if panel.page + 1 < panel.total_pages() {
                     panel.page += 1;
                     panel.highlighted = 0;
-                    self.show_content(c, panel, xime_config, candidate_window_visible);
+                    self.show_content(c, panel, theme, candidate_window_visible);
                 }
             }
             k if emoji_select_index(k).is_some() => {
@@ -779,7 +829,7 @@ impl WaylandLoop {
                     plugin_host,
                     panel,
                     panel_state,
-                    xime_config,
+                    theme,
                     candidate_window_visible,
                 );
             }
@@ -799,7 +849,7 @@ impl WaylandLoop {
         plugin_host: &PluginHost,
         panel: &mut SearchPanel,
         panel_state: &mut PanelState,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) {
         // 表情取多页（最多 3 页）；符号表完整保留（分页浏览）
@@ -834,9 +884,9 @@ impl WaylandLoop {
             panel.active = false;
             *panel_state = PanelState::Closed;
             c.hide_menu_panel();
-            self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+            self.redraw_menu_candidates(c, theme, candidate_window_visible);
         } else {
-            self.show_content(c, panel, xime_config, candidate_window_visible);
+            self.show_content(c, panel, theme, candidate_window_visible);
         }
     }
 
@@ -847,7 +897,7 @@ impl WaylandLoop {
         &self,
         c: &mut dyn ImBackend,
         panel: &SearchPanel,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) {
         // 当前页切片
@@ -866,11 +916,11 @@ impl WaylandLoop {
         }
         // 渲染：优先复用最近候选，无则空候选栏
         let cached = self.candidate_cache.lock().ok().and_then(|g| g.clone());
-        let (candidates, highlighted, primary_color) = match cached {
-            Some((cands, hi, col)) => (cands, hi, col),
-            None => (Vec::new(), 0usize, xime_config.get_primary_color()),
+        let (candidates, highlighted) = match cached {
+            Some((cands, hi)) => (cands, hi),
+            None => (Vec::new(), 0usize),
         };
-        if let Err(e) = c.show_candidate_window(&candidates, highlighted, primary_color) {
+        if let Err(e) = c.show_candidate_window(&candidates, highlighted, theme) {
             debug!("Content render candidate window error: {}", e);
         }
         let _ = c.flush();
@@ -886,7 +936,7 @@ impl WaylandLoop {
         search_panel: &mut SearchPanel,
         panel_state: &mut PanelState,
         last_panel_width: &u32,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
         pe: &xime_wayland::PointerEvent,
     ) {
@@ -894,10 +944,12 @@ impl WaylandLoop {
             PanelState::ContentOpen => {
                 // 内容网格：点击项直接上屏（面板保持打开，可连续选择）
                 let width = search_panel.panel_width().max(*last_panel_width);
+                let bar = theme.bar_height();
                 if let Some(idx) = xime_ui::content_item_hit(
                     pe.x,
                     pe.y,
                     width,
+                    bar,
                     search_panel.columns,
                     search_panel.page_len(),
                 ) {
@@ -909,23 +961,24 @@ impl WaylandLoop {
                     return;
                 }
                 // 菜单按钮：路由回菜单视图
-                if xime_ui::menu_button_hit(pe.x, pe.y, width) {
+                if xime_ui::menu_button_hit(pe.x, pe.y, width, theme.bar_height()) {
                     debug!("Menu button clicked, routing back to menu");
-                    let primary_color = xime_config.get_primary_color();
-                    if let Err(e) = c.show_menu_panel(None, primary_color) {
+                    if let Err(e) = c.show_menu_panel(None) {
                         debug!("Failed to show menu panel: {}", e);
                     } else {
                         *panel_state = PanelState::MenuOpen;
-                        self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                        self.redraw_menu_candidates(c, theme, candidate_window_visible);
                     }
                 }
                 // 其他区域（候选栏空白）：忽略
             }
             PanelState::MenuOpen => {
-                // 面板在候选栏下方展开：y >= 36 是面板区
-                if pe.y >= xime_ui::CANDIDATE_HEIGHT as i32 {
+                // 面板在候选栏下方展开：y >= 候选栏高度是面板区
+                let bar = theme.bar_height();
+                if pe.y >= bar as i32 {
                     // 点击面板入口
-                    if let Some(action) = xime_ui::menu_item_hit(pe.x, pe.y, *last_panel_width) {
+                    if let Some(action) = xime_ui::menu_item_hit(pe.x, pe.y, *last_panel_width, bar)
+                    {
                         debug!("Menu item clicked: {:?}", action);
                         if !action.is_available() {
                             // 未实现的功能：保持菜单打开，不做任何事
@@ -940,11 +993,7 @@ impl WaylandLoop {
                                 plugin_host.reload();
                                 if plugin_host.emoji_plugin_count() == 0 {
                                     debug!("Emoji menu click but no emoji plugins loaded");
-                                    self.redraw_menu_candidates(
-                                        c,
-                                        xime_config,
-                                        candidate_window_visible,
-                                    );
+                                    self.redraw_menu_candidates(c, theme, candidate_window_visible);
                                     return;
                                 }
                                 search_panel.open(PanelMode::Emoji);
@@ -961,7 +1010,7 @@ impl WaylandLoop {
                             plugin_host,
                             search_panel,
                             panel_state,
-                            xime_config,
+                            theme,
                             candidate_window_visible,
                         );
                         debug!("Content panel opened from menu: {:?}", search_panel.mode);
@@ -970,27 +1019,26 @@ impl WaylandLoop {
                     // 面板内但未命中入口：关闭
                     *panel_state = PanelState::Closed;
                     c.hide_menu_panel();
-                    self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                    self.redraw_menu_candidates(c, theme, candidate_window_visible);
                 } else {
                     // 点击候选栏区域
-                    if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width) {
+                    if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width, bar) {
                         *panel_state = PanelState::Closed;
                         c.hide_menu_panel();
-                        self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                        self.redraw_menu_candidates(c, theme, candidate_window_visible);
                         debug!("Menu button clicked, closing panel");
                     }
                 }
             }
             PanelState::Closed => {
                 // 候选栏最右侧按钮区域
-                if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width) {
+                if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width, theme.bar_height()) {
                     debug!("Menu button clicked, opening panel");
-                    let primary_color = xime_config.get_primary_color();
-                    if let Err(e) = c.show_menu_panel(None, primary_color) {
+                    if let Err(e) = c.show_menu_panel(None) {
                         debug!("Failed to show menu panel: {}", e);
                     } else {
                         *panel_state = PanelState::MenuOpen;
-                        self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                        self.redraw_menu_candidates(c, theme, candidate_window_visible);
                     }
                 }
             }
@@ -1002,13 +1050,12 @@ impl WaylandLoop {
     fn redraw_menu_candidates(
         &self,
         c: &mut dyn ImBackend,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) {
         let cached = self.candidate_cache.lock().ok().and_then(|g| g.clone());
-        if let Some((candidates, highlighted, _)) = cached {
-            let primary_color = xime_config.get_primary_color();
-            if let Err(e) = c.show_candidate_window(&candidates, highlighted, primary_color) {
+        if let Some((candidates, highlighted)) = cached {
+            if let Err(e) = c.show_candidate_window(&candidates, highlighted, theme) {
                 debug!("Menu redraw candidate window error: {}", e);
             }
             let _ = c.flush();
@@ -1026,6 +1073,7 @@ impl WaylandLoop {
         &self,
         c: &mut dyn ImBackend,
         xime_config: &XimeConfig,
+        theme: &PanelTheme,
         event: &xime_wayland::KeyEvent,
         _sym: Keysym,
         modifiers: ModifierState,
@@ -1050,8 +1098,7 @@ impl WaylandLoop {
                         debug!("root for '{}' (schema={}) = {:?}", letter, schema, root);
                         if let Some(root) = root {
                             debug!("Ctrl pressed, showing root for '{}': {}", letter, root);
-                            let primary_color = xime_config.get_primary_color();
-                            if let Err(e) = c.show_root_window(letter, &root, primary_color) {
+                            if let Err(e) = c.show_root_window(letter, &root, theme) {
                                 debug!("Failed to show root window: {}", e);
                             } else {
                                 *ctrl_root_visible = true;
@@ -1083,12 +1130,9 @@ impl WaylandLoop {
                             })
                             .collect();
                         let highlighted_index = menu.highlighted_candidate_index;
-                        let primary_color = xime_config.get_primary_color();
-                        if let Err(e) = c.show_candidate_window(
-                            &candidate_items,
-                            highlighted_index,
-                            primary_color,
-                        ) {
+                        if let Err(e) =
+                            c.show_candidate_window(&candidate_items, highlighted_index, theme)
+                        {
                             debug!("Failed to restore candidate window: {}", e);
                         }
                         if let Err(e) = c.flush() {

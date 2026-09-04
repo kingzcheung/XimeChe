@@ -1,6 +1,7 @@
 pub mod candidate;
 pub mod iced_view;
 pub mod menu;
+pub mod theme;
 
 pub use candidate::CandidateItem;
 pub use candidate::CandidateList;
@@ -14,6 +15,7 @@ pub use menu::{
     PanelView, CANDIDATE_HEIGHT, CONTENT_COLUMNS_MAX, CONTENT_GAP, CONTENT_ITEM_SIZE,
     CONTENT_MAX_WIDTH, CONTENT_ROWS, MENU_BUTTON_WIDTH, MENU_COLUMNS, MENU_ITEM_HEIGHT,
 };
+pub use theme::PanelTheme;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

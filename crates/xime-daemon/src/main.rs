@@ -91,6 +91,18 @@ fn main() -> anyhow::Result<()> {
 
         let (command_tx, command_rx) = mpsc::channel();
 
+        // 系统亮/暗色模式监听（org.freedesktop.portal.Settings 的
+        // color-scheme，KDE/GNOME 均支持）。portal 不可用时保持亮色。
+        rt.spawn({
+            let connection = connection.clone();
+            let command_tx = command_tx.clone();
+            async move {
+                if let Err(e) = watch_color_scheme(connection, command_tx).await {
+                    debug!("Color scheme watcher unavailable: {}", e);
+                }
+            }
+        });
+
         thread::spawn({
             let tray = tray.clone();
             let rt_handle = rt_handle.clone();
@@ -151,5 +163,47 @@ fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     })?;
 
+    Ok(())
+}
+
+/// 监听 portal 的 `color-scheme` 设置变化，向 daemon 发送 DarkMode 命令。
+/// 值语义：0 = 无偏好，1 = 偏好暗色，2 = 偏好亮色。
+async fn watch_color_scheme(
+    connection: Connection,
+    command_tx: mpsc::Sender<DaemonCommand>,
+) -> zbus::Result<()> {
+    use futures_lite::StreamExt;
+    use zbus::zvariant::OwnedValue;
+
+    let proxy = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Settings",
+    )
+    .await?;
+
+    // 初值：Read 返回 (v)，v 为 u32
+    let reply: (OwnedValue,) = proxy
+        .call("Read", &("org.freedesktop.appearance", "color-scheme"))
+        .await?;
+    if let Ok(mode) = reply.0.downcast_ref::<u32>() {
+        info!("System color scheme: mode={}", mode);
+        let _ = command_tx.send(DaemonCommand::DarkMode(mode == 1));
+    }
+
+    let mut changes = proxy.receive_signal("SettingChanged").await?;
+    while let Some(msg) = changes.next().await {
+        let Ok((namespace, key, value)) = msg.body().deserialize::<(String, String, OwnedValue)>()
+        else {
+            continue;
+        };
+        if namespace == "org.freedesktop.appearance" && key == "color-scheme" {
+            if let Ok(mode) = value.downcast_ref::<u32>() {
+                debug!("System color scheme changed: mode={}", mode);
+                let _ = command_tx.send(DaemonCommand::DarkMode(mode == 1));
+            }
+        }
+    }
     Ok(())
 }

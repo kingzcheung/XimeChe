@@ -17,7 +17,7 @@ use std::os::unix::net::UnixStream;
 use wayland_backend::client::Backend;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::Connection;
-use xime_ui::CandidateItem;
+use xime_ui::{CandidateItem, PanelTheme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
@@ -60,20 +60,16 @@ pub trait ImBackend {
         &mut self,
         candidates: &[CandidateItem],
         highlighted_index: usize,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) -> Result<(), String>;
     /// 候选栏自然宽度（内容 + 菜单按钮），用于命中测试。
-    fn candidate_width(&mut self, _candidates: &[CandidateItem]) -> u32 {
+    fn candidate_width(&mut self, _candidates: &[CandidateItem], _theme: &PanelTheme) -> u32 {
         200
     }
     fn hide_candidate_window(&mut self);
     /// 显示菜单面板（候选栏右侧按钮点击后展开的功能入口列表）。
     /// 面板内容含高亮入口（active_index = None 表示无高亮）。
-    fn show_menu_panel(
-        &mut self,
-        active_index: Option<usize>,
-        primary_color: (u8, u8, u8),
-    ) -> Result<(), String>;
+    fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<(), String>;
     /// 显示内容面板（表情/符号网格）。渲染随下一次 show_candidate_window 生效。
     fn show_content_panel(
         &mut self,
@@ -81,12 +77,8 @@ pub trait ImBackend {
         highlighted: Option<usize>,
     ) -> Result<(), String>;
     fn hide_menu_panel(&mut self);
-    fn show_root_window(
-        &mut self,
-        key: char,
-        root: &str,
-        primary_color: (u8, u8, u8),
-    ) -> Result<(), String>;
+    fn show_root_window(&mut self, key: char, root: &str, theme: &PanelTheme)
+        -> Result<(), String>;
     fn hide_root_window(&mut self);
     /// Recreate the input method object after the compositor reports it
     /// unavailable (e.g. GNOME lock screen). No-op on v1.
@@ -142,26 +134,22 @@ impl ImBackend for im_v1::WaylandConnectionV1 {
         &mut self,
         candidates: &[CandidateItem],
         highlighted_index: usize,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) -> Result<(), String> {
-        self.show_candidate_window(candidates, highlighted_index, primary_color)
+        self.show_candidate_window(candidates, highlighted_index, theme)
             .map_err(|e| e.to_string())
     }
 
-    fn candidate_width(&mut self, candidates: &[CandidateItem]) -> u32 {
-        self.candidate_width(candidates)
+    fn candidate_width(&mut self, candidates: &[CandidateItem], theme: &PanelTheme) -> u32 {
+        self.candidate_width(candidates, theme)
     }
 
     fn hide_candidate_window(&mut self) {
         self.hide_candidate_window()
     }
 
-    fn show_menu_panel(
-        &mut self,
-        active_index: Option<usize>,
-        primary_color: (u8, u8, u8),
-    ) -> Result<(), String> {
-        self.show_menu_panel(active_index, primary_color)
+    fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<(), String> {
+        self.show_menu_panel(active_index)
             .map_err(|e| e.to_string())
     }
 
@@ -182,9 +170,9 @@ impl ImBackend for im_v1::WaylandConnectionV1 {
         &mut self,
         key: char,
         root: &str,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) -> Result<(), String> {
-        self.show_root_window(key, root, primary_color)
+        self.show_root_window(key, root, theme)
             .map_err(|e| e.to_string())
     }
 
@@ -246,26 +234,22 @@ impl ImBackend for im_v2::WaylandConnectionV2 {
         &mut self,
         candidates: &[CandidateItem],
         highlighted_index: usize,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) -> Result<(), String> {
-        self.show_candidate_window(candidates, highlighted_index, primary_color)
+        self.show_candidate_window(candidates, highlighted_index, theme)
             .map_err(|e| e.to_string())
     }
 
-    fn candidate_width(&mut self, candidates: &[CandidateItem]) -> u32 {
-        self.candidate_width(candidates)
+    fn candidate_width(&mut self, candidates: &[CandidateItem], theme: &PanelTheme) -> u32 {
+        self.candidate_width(candidates, theme)
     }
 
     fn hide_candidate_window(&mut self) {
         self.hide_candidate_window()
     }
 
-    fn show_menu_panel(
-        &mut self,
-        active_index: Option<usize>,
-        primary_color: (u8, u8, u8),
-    ) -> Result<(), String> {
-        self.show_menu_panel(active_index, primary_color)
+    fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<(), String> {
+        self.show_menu_panel(active_index)
             .map_err(|e| e.to_string())
     }
 
@@ -286,9 +270,9 @@ impl ImBackend for im_v2::WaylandConnectionV2 {
         &mut self,
         key: char,
         root: &str,
-        primary_color: (u8, u8, u8),
+        theme: &PanelTheme,
     ) -> Result<(), String> {
-        self.show_root_window(key, root, primary_color)
+        self.show_root_window(key, root, theme)
             .map_err(|e| e.to_string())
     }
 

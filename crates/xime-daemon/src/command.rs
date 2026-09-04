@@ -8,6 +8,8 @@ pub enum DaemonCommand {
     ReloadStyle,
     ReloadPlugins,
     SelectSchema(String, oneshot::Sender<bool>),
+    /// 系统亮/暗色模式变化（portal color-scheme，true = 暗色）。
+    DarkMode(bool),
     Shutdown,
 }
 

@@ -163,22 +163,23 @@ pub fn menu_panel_height() -> u32 {
 }
 
 /// 展开后容器总高度（候选栏 + 菜单）。
-pub fn expanded_height() -> u32 {
-    CANDIDATE_HEIGHT + menu_panel_height()
+pub fn expanded_height(bar_height: u32) -> u32 {
+    bar_height + menu_panel_height()
 }
 
 /// 菜单按钮是否包含坐标（候选栏区域，surface 局部坐标）。
-pub fn menu_button_hit(x: i32, y: i32, panel_width: u32) -> bool {
+pub fn menu_button_hit(x: i32, y: i32, panel_width: u32, bar_height: u32) -> bool {
     let start = panel_width as i32 - MENU_BUTTON_WIDTH as i32;
-    x >= start && x < panel_width as i32 && y >= 0 && y < CANDIDATE_HEIGHT as i32
+    x >= start && x < panel_width as i32 && y >= 0 && y < bar_height as i32
 }
 
 /// 菜单面板中某坐标命中的入口。
 ///
-/// 面板在候选栏下方展开：候选栏 y ∈ [0, 36)，面板 y ∈ [36, 36+panel_height)。
+/// 面板在候选栏下方展开：候选栏 y ∈ [0, bar_height)，面板
+/// y ∈ [bar_height, bar_height+panel_height)。
 /// 面板为双列网格，单元格宽 = 容器宽/2，行高 = MENU_ITEM_HEIGHT。
-pub fn menu_item_hit(x: i32, y: i32, container_width: u32) -> Option<MenuAction> {
-    let panel_start = CANDIDATE_HEIGHT as i32;
+pub fn menu_item_hit(x: i32, y: i32, container_width: u32, bar_height: u32) -> Option<MenuAction> {
+    let panel_start = bar_height as i32;
     let panel_end = panel_start + menu_panel_height() as i32;
     if y < panel_start || y >= panel_end {
         return None;
@@ -194,16 +195,18 @@ pub fn menu_item_hit(x: i32, y: i32, container_width: u32) -> Option<MenuAction>
 
 /// 内容面板网格中某坐标命中的项（页内索引）。
 ///
-/// 网格在候选栏下方展开：y ∈ [36, 36+content_panel_height)，固定 CONTENT_ROWS 行、
-/// 指定列数，单元格宽 = 容器宽/列数，行高 = CONTENT_ITEM_SIZE + CONTENT_GAP。
+/// 网格在候选栏下方展开：y ∈ [bar_height, bar_height+content_panel_height)，
+/// 固定 CONTENT_ROWS 行、指定列数，单元格宽 = 容器宽/列数，
+/// 行高 = CONTENT_ITEM_SIZE + CONTENT_GAP。
 pub fn content_item_hit(
     x: i32,
     y: i32,
     panel_width: u32,
+    bar_height: u32,
     columns: usize,
     item_count: usize,
 ) -> Option<usize> {
-    let panel_start = CANDIDATE_HEIGHT as i32;
+    let panel_start = bar_height as i32;
     let panel_end = panel_start + content_panel_height() as i32;
     if y < panel_start || y >= panel_end {
         return None;
@@ -266,24 +269,28 @@ mod tests {
     #[test]
     fn test_content_item_hit() {
         let w = 414u32;
+        let bar = 36u32;
         let cols = 10usize;
         // 第 1 行第 1 列
-        assert_eq!(content_item_hit(0, 36, w, cols, 30), Some(0));
+        assert_eq!(content_item_hit(0, 36, w, bar, cols, 30), Some(0));
         // 第 1 行第 10 列
-        assert_eq!(content_item_hit(w as i32 - 1, 36, w, cols, 30), Some(9));
+        assert_eq!(
+            content_item_hit(w as i32 - 1, 36, w, bar, cols, 30),
+            Some(9)
+        );
         // 第 2 行（y = 36 + 42）
-        assert_eq!(content_item_hit(0, 78, w, cols, 30), Some(10));
+        assert_eq!(content_item_hit(0, 78, w, bar, cols, 30), Some(10));
         // 第 3 行（y = 36 + 2*42 = 120）
-        assert_eq!(content_item_hit(0, 120, w, cols, 30), Some(20));
-        assert_eq!(content_item_hit(0, 155, w, cols, 30), Some(20));
+        assert_eq!(content_item_hit(0, 120, w, bar, cols, 30), Some(20));
+        assert_eq!(content_item_hit(0, 155, w, bar, cols, 30), Some(20));
         // 超出网格范围
-        assert_eq!(content_item_hit(0, 35, w, cols, 30), None);
-        assert_eq!(content_item_hit(0, 36 + 120, w, cols, 30), None);
-        assert_eq!(content_item_hit(-1, 36, w, cols, 30), None);
+        assert_eq!(content_item_hit(0, 35, w, bar, cols, 30), None);
+        assert_eq!(content_item_hit(0, 36 + 120, w, bar, cols, 30), None);
+        assert_eq!(content_item_hit(-1, 36, w, bar, cols, 30), None);
         // 超出实际项数
-        assert_eq!(content_item_hit(0, 36, w, cols, 0), None);
-        assert_eq!(content_item_hit(0, 36, w, cols, 5), Some(0));
-        assert_eq!(content_item_hit(w as i32 - 1, 36, w, cols, 5), None);
+        assert_eq!(content_item_hit(0, 36, w, bar, cols, 0), None);
+        assert_eq!(content_item_hit(0, 36, w, bar, cols, 5), Some(0));
+        assert_eq!(content_item_hit(w as i32 - 1, 36, w, bar, cols, 5), None);
     }
 
     #[test]
@@ -300,5 +307,24 @@ mod tests {
             }),
             content_panel_height()
         );
+    }
+
+    #[test]
+    fn test_menu_button_hit_with_bar_height() {
+        // 默认 36px 候选栏：按钮区在右下角
+        assert!(menu_button_hit(378, 10, 414, 36));
+        assert!(!menu_button_hit(100, 10, 414, 36));
+        assert!(!menu_button_hit(378, 40, 414, 36));
+        // 大字号 48px 候选栏：y=40 仍属候选栏
+        assert!(menu_button_hit(378, 40, 414, 48));
+    }
+
+    #[test]
+    fn test_menu_item_hit_with_bar_height() {
+        // 默认 36px 候选栏：面板从 y=36 起
+        assert_eq!(menu_item_hit(10, 40, 414, 36), Some(MenuAction::Emoji));
+        // 大字号 48px 候选栏：y=40 仍在候选栏内，未命中面板
+        assert_eq!(menu_item_hit(10, 40, 414, 48), None);
+        assert_eq!(menu_item_hit(10, 52, 414, 48), Some(MenuAction::Emoji));
     }
 }

@@ -19,7 +19,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::protocol::*;
 use wayland_client::{event_created_child, globals::registry_queue_init, Connection, EventQueue};
 use wayland_client::{Dispatch, Proxy, QueueHandle};
-use xime_ui::{CandidateItem, GridItem, IcedSurface, PanelTheme, PanelView};
+use xime_ui::{CandidateItem, GridItem, IcedSurface, ListItem, ListKind, PanelTheme, PanelView};
 
 pub mod __interfaces {
     use wayland_client::protocol::__interfaces::*;
@@ -730,6 +730,8 @@ impl WaylandConnectionV1 {
                 let cell = xime_ui::content_cell_width(widest);
                 xime_ui::content_panel_width(cell, xime_ui::content_columns_for(cell)).max(measured)
             }
+            // 列表页最小宽度（无候选词时保证列表可读）
+            PanelView::List { .. } => measured.max(xime_ui::LIST_MIN_PANEL_WIDTH),
             _ => measured,
         };
 
@@ -848,6 +850,23 @@ impl WaylandConnectionV1 {
             highlighted,
         };
         debug!("Content panel set ({} items)", items.len());
+        Ok(())
+    }
+
+    /// 显示列表页面板（剪贴板/快捷发送）：仅设置状态，渲染随下一次
+    /// show_candidate_window 生效。
+    pub fn show_list_panel(
+        &mut self,
+        kind: ListKind,
+        items: &[ListItem],
+        highlighted: Option<usize>,
+    ) -> Result<()> {
+        self.state.panel_view = PanelView::List {
+            kind,
+            items: items.to_vec(),
+            highlighted,
+        };
+        debug!("List panel set ({} items, {:?})", items.len(), kind);
         Ok(())
     }
 

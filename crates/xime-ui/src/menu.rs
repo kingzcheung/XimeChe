@@ -64,6 +64,213 @@ pub fn content_panel_width(cell_width: u32, columns: usize) -> u32 {
     columns as u32 * cell_width + (columns as u32 - 1) * CONTENT_GAP
 }
 
+// ── 列表页面板（剪贴板/快捷发送）常量 ─────────────────────────────────────
+/// 列表页标题栏高度。
+pub const LIST_HEADER_HEIGHT: u32 = 40;
+/// 列表页行高（背景块）。
+pub const LIST_ROW_HEIGHT: u32 = 28;
+/// 行背景相对行点击区的上下内缩（行间视觉间隔 = 2× 该值）。
+pub const LIST_ROW_INSET: u32 = 2;
+/// 列表页行内按钮边长。
+pub const LIST_BUTTON_SIZE: u32 = 20;
+/// 列表页最多显示的行数。
+pub const LIST_LIMIT: usize = 5;
+/// 列表页底部"查看全部"入口高度。
+pub const LIST_MORE_HEIGHT: u32 = 30;
+/// 列表页水平边距。
+pub const LIST_H_INSET: u32 = 10;
+/// "← 菜单"返回按钮宽度。
+pub const LIST_BACK_WIDTH: u32 = 60;
+/// 列表面板最小宽度（无候选词时保证列表可读）。
+pub const LIST_MIN_PANEL_WIDTH: u32 = 360;
+
+/// 列表页面板高度（标题栏 + 5 行 + 查看全部）。
+pub fn list_panel_height() -> u32 {
+    LIST_HEADER_HEIGHT
+        + LIST_LIMIT as u32 * (LIST_ROW_HEIGHT + 2 * LIST_ROW_INSET)
+        + LIST_MORE_HEIGHT
+}
+
+/// 列表页第 i 行背景的 y（面板区局部坐标，从标题栏下 4px 起）。
+pub fn list_row_y(i: usize) -> u32 {
+    LIST_HEADER_HEIGHT + 4 + i as u32 * (LIST_ROW_HEIGHT + 2 * LIST_ROW_INSET)
+}
+
+/// 列表页类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    Clipboard,
+    QuickSend,
+}
+
+impl ListKind {
+    pub fn title(self) -> &'static str {
+        match self {
+            ListKind::Clipboard => "剪切板",
+            ListKind::QuickSend => "快捷发送",
+        }
+    }
+
+    /// 行内是否有"加入快捷发送"按钮（仅剪贴板页）。
+    pub fn has_quick_send_button(self) -> bool {
+        self == ListKind::Clipboard
+    }
+}
+
+/// 列表页条目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListItem {
+    pub id: i64,
+    pub text: String,
+    pub is_pinned: bool,
+}
+
+/// 列表行内操作按钮。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRowButton {
+    /// 加入快捷发送（仅剪贴板页）。
+    QuickSend,
+    /// 删除条目。
+    Remove,
+}
+
+/// 列表页命中结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListHit {
+    /// 标题栏"← 菜单"返回按钮。
+    Back,
+    /// 标题栏"清空"按钮。
+    Clear,
+    /// 底部"查看全部"入口。
+    More,
+    /// 命中某行：button 为 None 表示行主体（点选上屏）。
+    Row {
+        index: usize,
+        button: Option<ListRowButton>,
+    },
+}
+
+/// 行内删除按钮矩形（surface 局部坐标）。
+fn list_remove_btn_rect(y: u32, panel_width: u32) -> (u32, u32) {
+    let x = panel_width - LIST_H_INSET - LIST_BUTTON_SIZE;
+    let btn_y = y + (LIST_ROW_HEIGHT - LIST_BUTTON_SIZE) / 2;
+    (x, btn_y)
+}
+
+/// 行内"加入快捷发送"按钮矩形（删除按钮左侧）。
+fn list_quick_send_btn_rect(y: u32, panel_width: u32) -> (u32, u32) {
+    let (rx, by) = list_remove_btn_rect(y, panel_width);
+    (rx - LIST_BUTTON_SIZE - 6, by)
+}
+
+/// 文本按估算宽度截断并追加 "…"（估算以 16px 为基准，偏保守）。
+pub fn truncate_to_width(text: &str, max_width: u32) -> String {
+    if content_text_width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let candidate = format!("{out}{ch}");
+        if !out.is_empty() && content_text_width(&candidate) + 17 > max_width {
+            break;
+        }
+        out = candidate;
+    }
+    format!("{out}…")
+}
+
+/// 列表页命中测试（绘制几何与点击共用，面板区 y ∈ [bar, bar+list_panel_height)）。
+pub fn list_page_hit(
+    x: i32,
+    y: i32,
+    panel_width: u32,
+    bar_height: u32,
+    item_count: usize,
+    is_quick_send: bool,
+) -> Option<ListHit> {
+    let panel_start = bar_height as i32;
+    let panel_end = panel_start + list_panel_height() as i32;
+    if y < panel_start || y >= panel_end || x < 0 || x >= panel_width as i32 {
+        return None;
+    }
+    let w = panel_width;
+    let local_y = (y - panel_start) as u32;
+
+    // 标题栏按钮："← 菜单"（右上）与"清空"（其左侧）
+    let back_x = w - LIST_BACK_WIDTH - LIST_H_INSET;
+    let title_btn_y = LIST_HEADER_HEIGHT - 24 - 8;
+    if local_y >= title_btn_y
+        && local_y < title_btn_y + 24
+        && x >= back_x as i32
+        && x < (back_x + LIST_BACK_WIDTH) as i32
+    {
+        return Some(ListHit::Back);
+    }
+    let clear_x = back_x - 8 - LIST_BUTTON_SIZE;
+    if local_y >= title_btn_y + 2
+        && local_y < title_btn_y + 2 + LIST_BUTTON_SIZE
+        && x >= clear_x as i32
+        && x < (clear_x + LIST_BUTTON_SIZE) as i32
+    {
+        return Some(ListHit::Clear);
+    }
+
+    // 底部"查看全部"入口条
+    let more_y = list_panel_height() - LIST_MORE_HEIGHT;
+    if local_y >= more_y {
+        return Some(ListHit::More);
+    }
+
+    // 行区域
+    for i in 0..item_count.min(LIST_LIMIT) {
+        let row_y = list_row_y(i);
+        let row_end = row_y + LIST_ROW_HEIGHT;
+        if local_y < row_y || local_y >= row_end {
+            continue;
+        }
+        // 按钮优先
+        let (rx, ry) = list_remove_btn_rect(row_y, w);
+        if local_y >= ry
+            && local_y < ry + LIST_BUTTON_SIZE
+            && x >= rx as i32
+            && x < (rx + LIST_BUTTON_SIZE) as i32
+        {
+            return Some(ListHit::Row {
+                index: i,
+                button: Some(ListRowButton::Remove),
+            });
+        }
+        if !is_quick_send {
+            let (qx, qy) = list_quick_send_btn_rect(row_y, w);
+            if local_y >= qy
+                && local_y < qy + LIST_BUTTON_SIZE
+                && x >= qx as i32
+                && x < (qx + LIST_BUTTON_SIZE) as i32
+            {
+                return Some(ListHit::Row {
+                    index: i,
+                    button: Some(ListRowButton::QuickSend),
+                });
+            }
+        }
+        // 行主体（含行背景左缘至按钮区之间的空隙）
+        let actions_w = if is_quick_send {
+            LIST_BUTTON_SIZE
+        } else {
+            LIST_BUTTON_SIZE * 2 + 6
+        };
+        let body_end = w - LIST_H_INSET - actions_w;
+        if x < body_end as i32 {
+            return Some(ListHit::Row {
+                index: i,
+                button: None,
+            });
+        }
+        return None;
+    }
+    None
+}
+
 /// 内容面板网格项（表情/符号）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GridItem {
@@ -84,6 +291,12 @@ pub enum PanelView {
         items: Vec<GridItem>,
         highlighted: Option<usize>,
     },
+    /// 列表页（剪贴板/快捷发送），highlighted 为页内行索引。
+    List {
+        kind: ListKind,
+        items: Vec<ListItem>,
+        highlighted: Option<usize>,
+    },
 }
 
 /// 展开区高度（视当前视图而定）。
@@ -92,6 +305,7 @@ pub fn panel_height_for(view: &PanelView) -> u32 {
         PanelView::Closed => 0,
         PanelView::Menu(_) => menu_panel_height(),
         PanelView::Content { .. } => content_panel_height(),
+        PanelView::List { .. } => list_panel_height(),
     }
 }
 
@@ -142,11 +356,6 @@ impl MenuAction {
             MenuAction::Clipboard => 2,
             MenuAction::QuickSend => 3,
         }
-    }
-
-    /// 功能是否已实现（未实现的入口置灰，点击无效）。
-    pub fn is_available(self) -> bool {
-        matches!(self, MenuAction::Emoji | MenuAction::Symbols)
     }
 
     pub const ALL: [MenuAction; 4] = [
@@ -317,6 +526,113 @@ mod tests {
         assert!(!menu_button_hit(378, 40, 414, 36));
         // 大字号 48px 候选栏：y=40 仍属候选栏
         assert!(menu_button_hit(378, 40, 414, 48));
+    }
+
+    #[test]
+    fn test_list_panel_geometry() {
+        // 40 + 5*(28+4) + 30 = 230
+        assert_eq!(list_panel_height(), 230);
+        assert_eq!(list_row_y(0), LIST_HEADER_HEIGHT + 4);
+        assert_eq!(list_row_y(4), LIST_HEADER_HEIGHT + 4 + 4 * 32);
+        assert_eq!(list_row_y(5), list_row_y(4) + 32);
+    }
+
+    #[test]
+    fn test_list_page_hit_rows() {
+        let w = 400u32;
+        let bar = 36u32;
+        // 第 1 行主体（行 y = 36+44 = 80，中心 y ≈ 94）
+        let row0 = 36 + list_row_y(0) as i32 + 10;
+        assert_eq!(
+            list_page_hit(50, row0, w, bar, 3, false),
+            Some(ListHit::Row {
+                index: 0,
+                button: None
+            })
+        );
+        // 第 3 行
+        let row2 = 36 + list_row_y(2) as i32 + 10;
+        assert_eq!(
+            list_page_hit(50, row2, w, bar, 3, false),
+            Some(ListHit::Row {
+                index: 2,
+                button: None
+            })
+        );
+        // 超出实际行数（第 4 行点击无效）
+        let row3 = 36 + list_row_y(3) as i32 + 10;
+        assert_eq!(list_page_hit(50, row3, w, bar, 3, false), None);
+        // 删除按钮（行右侧）
+        let rx = w as i32 - LIST_H_INSET as i32 - LIST_BUTTON_SIZE as i32 + 5;
+        assert_eq!(
+            list_page_hit(rx, row0, w, bar, 3, false),
+            Some(ListHit::Row {
+                index: 0,
+                button: Some(ListRowButton::Remove)
+            })
+        );
+        // 剪贴板页：删除按钮左侧是"加入快捷发送"
+        let qx = rx - LIST_BUTTON_SIZE as i32 - 6 + 5;
+        assert_eq!(
+            list_page_hit(qx, row0, w, bar, 3, false),
+            Some(ListHit::Row {
+                index: 0,
+                button: Some(ListRowButton::QuickSend)
+            })
+        );
+        // 快捷发送页：同一位置是行主体（无快捷发送按钮）
+        assert_eq!(
+            list_page_hit(qx, row0, w, bar, 3, true),
+            Some(ListHit::Row {
+                index: 0,
+                button: None
+            })
+        );
+    }
+
+    #[test]
+    fn test_list_page_hit_header_and_more() {
+        let w = 400u32;
+        let bar = 36u32;
+        // "← 菜单"返回按钮（标题栏右上）
+        let back_x = (w - LIST_BACK_WIDTH - LIST_H_INSET) as i32 + 10;
+        let back_y = 36 + (LIST_HEADER_HEIGHT - 24 - 8) as i32 + 10;
+        assert_eq!(
+            list_page_hit(back_x, back_y, w, bar, 3, false),
+            Some(ListHit::Back)
+        );
+        // "清空"按钮（返回按钮左侧）
+        let clear_x = back_x - 8 - LIST_BUTTON_SIZE as i32 + 5;
+        assert_eq!(
+            list_page_hit(clear_x, back_y + 2, w, bar, 3, false),
+            Some(ListHit::Clear)
+        );
+        // 底部"查看全部"
+        let more_y = 36 + (list_panel_height() - LIST_MORE_HEIGHT) as i32 + 10;
+        assert_eq!(
+            list_page_hit(50, more_y, w, bar, 3, false),
+            Some(ListHit::More)
+        );
+        // 面板外
+        assert_eq!(list_page_hit(50, 10, w, bar, 3, false), None);
+        assert_eq!(
+            list_page_hit(50, 36 + list_panel_height() as i32, w, bar, 3, false),
+            None
+        );
+        assert_eq!(list_page_hit(-1, back_y, w, bar, 3, false), None);
+    }
+
+    #[test]
+    fn test_truncate_to_width() {
+        // 短文本不截断
+        assert_eq!(truncate_to_width("你好", 100), "你好");
+        // 长文本截断加省略号
+        let long = "这是一段很长很长很长的剪贴板内容需要被截断显示";
+        let t = truncate_to_width(long, 120);
+        assert!(t.ends_with('…'));
+        assert!(t.chars().count() < long.chars().count() + 1);
+        // 空文本
+        assert_eq!(truncate_to_width("", 10), "");
     }
 
     #[test]

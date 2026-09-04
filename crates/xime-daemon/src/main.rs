@@ -91,6 +91,10 @@ fn main() -> anyhow::Result<()> {
 
         let (command_tx, command_rx) = mpsc::channel();
 
+        // 剪贴板/快捷发送存储（SQLite，表结构对齐 Android）+ 系统剪贴板监听。
+        let clipboard_store = xime_clipboard::store::init(xime_clipboard::default_db_dir());
+        xime_clipboard::watcher::spawn_watcher(clipboard_store.clone());
+
         // 系统亮/暗色模式监听（org.freedesktop.portal.Settings 的
         // color-scheme，KDE/GNOME 均支持）。portal 不可用时保持亮色。
         rt.spawn({
@@ -107,7 +111,7 @@ fn main() -> anyhow::Result<()> {
             let tray = tray.clone();
             let rt_handle = rt_handle.clone();
             move || {
-                let wayland_loop = WaylandLoop::new(command_rx, tray, rt_handle);
+                let wayland_loop = WaylandLoop::new(command_rx, tray, rt_handle, clipboard_store);
                 wayland_loop.run();
             }
         });

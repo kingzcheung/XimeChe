@@ -18,8 +18,10 @@ type Mask = tiny_skia11::Mask;
 use crate::theme::PanelTheme;
 use crate::CandidateItem;
 use crate::{
-    content_cell_width, content_columns_for, content_text_width, GridItem, MenuAction, PanelView,
-    CONTENT_GAP, CONTENT_ITEM_SIZE, CONTENT_ROWS, MENU_BUTTON_WIDTH, MENU_COLUMNS,
+    content_cell_width, content_columns_for, content_text_width, truncate_to_width, GridItem,
+    ListItem, ListKind, MenuAction, PanelView, CONTENT_GAP, CONTENT_ITEM_SIZE, CONTENT_ROWS,
+    LIST_BUTTON_SIZE, LIST_HEADER_HEIGHT, LIST_H_INSET, LIST_LIMIT, LIST_MIN_PANEL_WIDTH,
+    LIST_MORE_HEIGHT, LIST_ROW_HEIGHT, LIST_ROW_INSET, MENU_BUTTON_WIDTH, MENU_COLUMNS,
     MENU_ITEM_HEIGHT,
 };
 
@@ -443,6 +445,15 @@ fn build_panel_view<'a>(
             let divider = panel_divider(theme);
             iced_widget::column![bar, divider, grid].into()
         }
+        PanelView::List {
+            kind,
+            items,
+            highlighted,
+        } => {
+            let page = list_page(*kind, items, *highlighted, theme);
+            let divider = panel_divider(theme);
+            iced_widget::column![bar, divider, page].into()
+        }
     };
 
     // 背景圆角/边框由 paint_rounded_panel 自绘（SDF 精确），这里透明
@@ -524,17 +535,8 @@ fn menu_cell(
     theme: &PanelTheme,
 ) -> Element<'static, (), Theme, Renderer> {
     let idx = action.index();
-    let available = action.is_available();
-    let color = if available {
-        menu_item_color(idx)
-    } else {
-        theme.text_comment
-    };
-    let label_color = if available {
-        theme.text_main
-    } else {
-        theme.text_comment
-    };
+    let color = menu_item_color(idx);
+    let label_color = theme.text_main;
     let first = action.label().chars().next().unwrap_or('?');
     let chip = container(text(first.to_string()).size(theme.font_size).color(color))
         .width(32)
@@ -658,6 +660,200 @@ fn content_cell(
         ..Default::default()
     })
     .into()
+}
+
+// ── 列表页面板（剪贴板/快捷发送） ─────────────────────────────────────────
+
+/// 行背景色（静态中性色：亮色偏黑、暗色偏亮灰，对齐 macOS 版 neutral_overlay）。
+fn neutral_row_bg(theme: &PanelTheme, alpha: f32) -> Color {
+    if theme.dark {
+        Color::from_rgba8(0x59, 0x5E, 0x6B, alpha)
+    } else {
+        Color::from_rgba8(0x00, 0x00, 0x00, alpha)
+    }
+}
+
+/// 列表页：标题栏（标题 + 清空 + ← 菜单）+ 最多 5 行条目 + 查看全部。
+fn list_page<'a>(
+    kind: ListKind,
+    items: &'a [ListItem],
+    highlighted: Option<usize>,
+    theme: &'a PanelTheme,
+) -> Element<'a, (), Theme, Renderer> {
+    let title_size = theme.font_size + 1.0;
+    let small_size = theme.font_size;
+
+    // 标题栏
+    let header = container(
+        row![
+            text(kind.title()).size(title_size).color(theme.text_main),
+            Space::new().width(iced_widget::core::Length::Fill),
+            text("清空").size(small_size).color(theme.text_comment),
+            text("← 菜单").size(small_size).color(theme.text_comment),
+        ]
+        .spacing(16)
+        .align_y(iced_widget::core::alignment::Vertical::Center),
+    )
+    .width(iced_widget::core::Length::Fill)
+    .height(LIST_HEADER_HEIGHT)
+    .padding([0, LIST_H_INSET as u16])
+    .align_y(iced_widget::core::alignment::Vertical::Center);
+
+    // 条目行（固定 LIST_LIMIT 行，空位留白）
+    let mut rows = iced_widget::column![].spacing((2 * LIST_ROW_INSET) as f32);
+    for i in 0..LIST_LIMIT {
+        let row_widget: Element<'static, (), Theme, Renderer> = match items.get(i) {
+            Some(item) => list_row(item, highlighted == Some(i), kind, theme),
+            None => Space::new()
+                .width(iced_widget::core::Length::Fill)
+                .height(LIST_ROW_HEIGHT)
+                .into(),
+        };
+        rows = rows.push(row_widget);
+    }
+
+    // 空态 / 底部"查看全部"
+    let body: Element<'a, (), Theme, Renderer> = if items.is_empty() {
+        container(text("暂无内容").size(small_size).color(theme.text_comment))
+            .width(iced_widget::core::Length::Fill)
+            .align_x(iced_widget::core::alignment::Horizontal::Center)
+            .into()
+    } else {
+        container(rows)
+            .padding([4, 0])
+            .width(iced_widget::core::Length::Fill)
+            .into()
+    };
+
+    let more_bg = neutral_row_bg(theme, 0.05);
+    let more_color = theme.text_comment;
+    let more = container(
+        row![
+            text("查看全部").size(small_size).color(more_color),
+            Space::new().width(iced_widget::core::Length::Fill),
+            text("›").size(small_size).color(more_color),
+        ]
+        .align_y(iced_widget::core::alignment::Vertical::Center),
+    )
+    .width(iced_widget::core::Length::Fill)
+    .height(LIST_MORE_HEIGHT)
+    .padding([0, (LIST_H_INSET + 4) as u16])
+    .align_y(iced_widget::core::alignment::Vertical::Center)
+    .style(move |_| container::Style {
+        background: Some(iced_widget::core::Background::Color(more_bg)),
+        ..Default::default()
+    });
+
+    iced_widget::column![header, body, more]
+        .width(iced_widget::core::Length::Fill)
+        .into()
+}
+
+/// 单条列表行：置顶标记 + 文本（超宽截断）+ 行内按钮。
+fn list_row(
+    item: &ListItem,
+    highlighted: bool,
+    kind: ListKind,
+    theme: &PanelTheme,
+) -> Element<'static, (), Theme, Renderer> {
+    let small_size = theme.font_size;
+    let (pr, pg, pb) = (
+        (theme.primary.r * 255.0) as u8,
+        (theme.primary.g * 255.0) as u8,
+        (theme.primary.b * 255.0) as u8,
+    );
+
+    // 行主体宽度 = 容器宽 - 右侧按钮区（截断估算用，偏保守）
+    let actions_w = if kind.has_quick_send_button() {
+        LIST_BUTTON_SIZE * 2 + 6
+    } else {
+        LIST_BUTTON_SIZE
+    };
+    let body_max = LIST_MIN_PANEL_WIDTH.saturating_sub(2 * LIST_H_INSET + actions_w + 24);
+
+    let mut content = iced_widget::row![]
+        .spacing(8)
+        .align_y(iced_widget::core::alignment::Vertical::Center);
+    if item.is_pinned {
+        content = content.push(text("★").size(small_size).color(theme.primary));
+    }
+    content = content.push(
+        text(truncate_to_width(&item.text, body_max))
+            .size(small_size)
+            .color(theme.text_main)
+            .wrapping(iced_widget::core::text::Wrapping::None),
+    );
+
+    let mut row_widget =
+        iced_widget::row![content].align_y(iced_widget::core::alignment::Vertical::Center);
+    row_widget = row_widget.push(Space::new().width(iced_widget::core::Length::Fill));
+    let btn_text_color = theme.text_comment;
+    let btn_bg = neutral_row_bg(theme, 0.10);
+    let btn_radius = (theme.highlight_radius() - 2.0).max(2.0);
+    let btn_font = theme.font_size - 2.0;
+    if kind.has_quick_send_button() {
+        row_widget = row_widget.push(round_text_button(
+            "＋",
+            btn_text_color,
+            btn_bg,
+            btn_radius,
+            btn_font,
+        ));
+    }
+    row_widget = row_widget.push(round_text_button(
+        "×",
+        btn_text_color,
+        btn_bg,
+        btn_radius,
+        btn_font,
+    ));
+
+    let neutral_bg = neutral_row_bg(theme, 0.06);
+    let radius = theme.highlight_radius();
+    container(row_widget)
+        .width(iced_widget::core::Length::Fill)
+        .height(LIST_ROW_HEIGHT)
+        .padding([0, LIST_H_INSET as u16])
+        .align_y(iced_widget::core::alignment::Vertical::Center)
+        .style(move |_| container::Style {
+            background: if highlighted {
+                Some(iced_widget::core::Background::Color(Color::from_rgba8(
+                    pr, pg, pb, 0.13,
+                )))
+            } else {
+                Some(iced_widget::core::Background::Color(neutral_bg))
+            },
+            border: iced_widget::core::border::Border {
+                radius: iced_widget::core::border::Radius::from(radius),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// 行内小圆角文字按钮（＋ / ×）。
+fn round_text_button(
+    label: &'static str,
+    text_color: Color,
+    bg: Color,
+    radius: f32,
+    font_size: f32,
+) -> Element<'static, (), Theme, Renderer> {
+    container(text(label.to_string()).size(font_size).color(text_color))
+        .width(LIST_BUTTON_SIZE)
+        .height(LIST_BUTTON_SIZE)
+        .align_x(iced_widget::core::alignment::Horizontal::Center)
+        .align_y(iced_widget::core::alignment::Vertical::Center)
+        .style(move |_| container::Style {
+            background: Some(iced_widget::core::Background::Color(bg)),
+            border: iced_widget::core::border::Border {
+                radius: iced_widget::core::border::Radius::from(radius),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// 字根窗口：`[key] root`。

@@ -17,7 +17,7 @@ use std::os::unix::net::UnixStream;
 use wayland_backend::client::Backend;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::Connection;
-use xime_ui::{CandidateItem, PanelTheme};
+use xime_ui::{CandidateItem, ListItem, ListKind, PanelTheme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
@@ -74,6 +74,13 @@ pub trait ImBackend {
     fn show_content_panel(
         &mut self,
         items: &[xime_ui::GridItem],
+        highlighted: Option<usize>,
+    ) -> Result<(), String>;
+    /// 显示列表页面板（剪贴板/快捷发送）。渲染随下一次 show_candidate_window 生效。
+    fn show_list_panel(
+        &mut self,
+        kind: ListKind,
+        items: &[ListItem],
         highlighted: Option<usize>,
     ) -> Result<(), String>;
     fn hide_menu_panel(&mut self);
@@ -159,6 +166,16 @@ impl ImBackend for im_v1::WaylandConnectionV1 {
         highlighted: Option<usize>,
     ) -> Result<(), String> {
         self.show_content_panel(items, highlighted)
+            .map_err(|e| e.to_string())
+    }
+
+    fn show_list_panel(
+        &mut self,
+        kind: ListKind,
+        items: &[ListItem],
+        highlighted: Option<usize>,
+    ) -> Result<(), String> {
+        self.show_list_panel(kind, items, highlighted)
             .map_err(|e| e.to_string())
     }
 
@@ -259,6 +276,16 @@ impl ImBackend for im_v2::WaylandConnectionV2 {
         highlighted: Option<usize>,
     ) -> Result<(), String> {
         self.show_content_panel(items, highlighted)
+            .map_err(|e| e.to_string())
+    }
+
+    fn show_list_panel(
+        &mut self,
+        kind: ListKind,
+        items: &[ListItem],
+        highlighted: Option<usize>,
+    ) -> Result<(), String> {
+        self.show_list_panel(kind, items, highlighted)
             .map_err(|e| e.to_string())
     }
 

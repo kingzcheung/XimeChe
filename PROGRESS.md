@@ -1,11 +1,38 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**候选栏功能移植（macOS 版 XimeYi → XimeChe）第一批完成：主题样式 + 亮/暗模式、剪贴板/快捷发送面板**（2026-09-05）
+**插件系统应用扩展完成（参照 Android 版 Xime 的插件应用模式）**（2026-09-05）
 
-- 剪贴板监听依赖 data-control 协议（KDE/wlroots 支持；GNOME 无对应协议，自动捕获不可用，面板本身可用）
-- 剪贴板数据库：`~/.config/xime/clipboard.db`，表结构对齐 Android 版（可跨端互换）
-- 待实机验证：候选栏主题切换（ReloadStyle / 系统亮暗切换）、剪贴板捕获 → 面板上屏全流程
+- 四个功能点：network.hosts 白名单强制、clipboard_sync 同步桥、
+  host.clipboard/quickSend 只读 API、text_committed 事件、快捷发送编码注入
+- libximecore 本地 patch（.cargo/config.toml）改了 xime-plugin crate，随 XimeChe 一起提交
+- 待实机验证：安装真实 webdav-clipboard-sync 插件跑通同步；快捷发送条目需先有 code
+  （面板 ＋ 按钮添加的条目 code 为空，编码管理 UI 待 xime-setup）
+
+## 本次变更（2026-09-05）③：插件系统应用扩展（参照 Android 版）
+1. **network.hosts 白名单强制**（libximecore xime-plugin，fail-closed）
+   - 未声明网络能力 → host.http.request 全部拒绝；声明 hosts → 仅白名单域名
+     （归一化比较：去 scheme/路径/端口、忽略大小写）；allowCustomHosts: true → 放行
+   - PluginRuntime::load 签名改为 manifest 驱动；测试 4 个（含 Lua 层拒绝路径）
+2. **clipboard_sync 同步桥**（daemon clipboard_sync.rs，对齐 Android ClipboardSyncBridge）
+   - 独立线程 SyncBridge：捕获 → push（SHA-256 hash 去重，profile 字段对齐
+     Android ClipboardProfile snake_case）；启动/ReloadPlugins/打开剪贴板面板 → pull
+     （回声抑制：跳过自己刚推送的 hash；远端条目 upsert_and_trim 入库）
+   - Lua 运行时在桥线程内创建；watcher 捕获经回调转发（spawn_watcher_with_callback）
+   - 模拟远端插件测试：push 去重/pull 回声抑制/重载 5 个
+3. **host.clipboard / host.quickSend 只读 API**（libximecore host_api.rs，能力门禁）
+   - ClipboardReadApi/QuickSendReadApi trait（宿主实现、运行时消费，依赖反转）
+   - manifest capabilities 强类型解析 RuntimeCaps；声明 clipboard_read/quick_send_read
+     且宿主提供实现才注入，否则 host.* 不可见；daemon 侧 ClipboardStore 适配器
+4. **text_committed 下行事件**（libximecore deliver_event + daemon 广播）
+   - 仅 manifest capabilities.events 订阅且实现 onPluginEvent 的插件被调用
+   - daemon 全部上屏路径广播：Rime 提交、表情/符号面板（键盘+点击）、
+     剪贴板/快捷发送列表提交（键盘+点击）
+5. **快捷发送编码注入候选栏**（daemon wayland.rs，对齐 Android quick-send-demo）
+   - Rime 当页候选后追加编码前缀命中条目（comment 显示编码，总位数 ≤9）；
+     数字键超出 Rime 候选数的部分宿主接管提交
+   - Rime 无候选时完全接管：高亮导航/Return/Space/Esc；字母键落穿 Rime
+   - 原始输入 = preedit[..sel_start]；孤儿释放抑制；无候选时清空候选缓存
 
 ## 本次变更（2026-09-05）①：主题样式接入 + 亮/暗色模式（移植自 XimeYi UiStyle/ui_colors）
 1. **xime-ui 新增 `PanelTheme`**（theme.rs）

@@ -152,3 +152,25 @@
 2. 事件驱动无轮询开销；文本读取用 socketpair + 1 MiB 上限防阻塞
 3. KDE（主目标环境）与 wlroots 系均支持；GNOME 两者皆无 → 自动捕获不可用（记录为已知限制，面板功能本身可用）
 4. 存储层原样移植 macOS 版：表结构对齐 Android（`clipboard_entries` v3），db 文件三端可互换
+
+## 2026-09-05: 插件系统应用模式对齐 Android 版（能力门禁 + 分层职责）
+
+**问题**：XimeChe 插件系统只有 emoji 查询一条通道，无钩子；剪贴板功能与插件零耦合
+
+**决策**（参照 Android 版 Xime 的三层模式）：
+1. 剪贴板本地功能是宿主服务（xime-clipboard），插件只做「同步」——
+   clipboard_sync 契约（push/pull/testConnection，libximecore 已有）由 daemon
+   SyncBridge 独立线程接线，push 用 SHA-256 hash 去重，pull 做回声抑制
+2. 宿主数据对插件只读：host.clipboard / host.quickSend 按 manifest
+   capabilities 门禁注入（trait 由宿主实现，依赖反转），未声明能力不可见
+3. 下行事件（text_committed）同步投递，仅 capabilities.events 订阅者收到
+4. network.hosts fail-closed：未声明网络能力的插件禁止 host.http.request；
+   allowCustomHosts: true 视为用户显式授权放行
+5. 快捷发送编码注入候选栏用宿主原生实现（Rime 候选后追加 + 数字键分区接管），
+   不做 transformCandidates 同步钩子——Wayland 按键是同步循环，Lua 卡顿
+   直接冻结输入，风险高于 Android
+
+**理由**：
+1. Android 版验证过的职责划分：本地剪贴板稳定在宿主，跨设备同步交给插件生态
+2. fail-closed 补上了 host.http 白名单缺失的安全洞（此前任意插件可联网）
+3. 同步在独立线程：Lua http 20s 超时不阻塞按键路径

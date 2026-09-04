@@ -1,7 +1,47 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**诊断：复制内容后 QQ 等窗口无法输入中文 = 客户端 Chromium text-input-v3 bug，非 Xime 缺陷**（2026-08-28）
+**候选栏功能移植（macOS 版 XimeYi → XimeChe）第一批完成：主题样式 + 亮/暗模式、剪贴板/快捷发送面板**（2026-09-05）
+
+- 剪贴板监听依赖 data-control 协议（KDE/wlroots 支持；GNOME 无对应协议，自动捕获不可用，面板本身可用）
+- 剪贴板数据库：`~/.config/xime/clipboard.db`，表结构对齐 Android 版（可跨端互换）
+- 待实机验证：候选栏主题切换（ReloadStyle / 系统亮暗切换）、剪贴板捕获 → 面板上屏全流程
+
+## 本次变更（2026-09-05）①：主题样式接入 + 亮/暗色模式（移植自 XimeYi UiStyle/ui_colors）
+1. **xime-ui 新增 `PanelTheme`**（theme.rs）
+   - 字号/圆角/高亮色 + 亮暗两套配色（亮 bg #F5F5F7/暗 bg #24262B，取自 macOS 版 ui_colors）
+   - `bar_height()`：候选栏高度随字号自适应（默认 ≤16 保持 36px 命中几何不变，大字号 2×字号+8，上限 72）
+   - iced_view 全部硬编码颜色/字号/圆角替换为 theme 驱动；高亮块圆角 = corner_radius-2
+2. **ImBackend 接口透传 theme**（v1/v2 同构）：show_candidate_window/show_root_window/candidate_width；
+   show_menu_panel 去掉无用的 color 参数；SHM buffer 高度按 bar_height + 面板高度计算
+3. **daemon**：从 xime.yaml 构建 theme（font_size/corner_radius/primary_color）；
+   `style.candidate_count`（clamp 1..9）限制展示条数；candidate_cache 改存候选+高亮（主题以当前值为准）
+4. **亮/暗色检测**：zbus 监听 `org.freedesktop.portal.Settings` 的 color-scheme（KDE/GNOME 标准接口），
+   变化 → `DaemonCommand::DarkMode(bool)` → 重建 theme + 候选栏可见时重绘；portal 不可用保持亮色
+5. **ReloadStyle 现在重建完整主题**（此前只有 primary_color 生效）
+6. 菜单/命中测试几何带 bar_height 参数（menu_button_hit/menu_item_hit/content_item_hit）
+
+## 本次变更（2026-09-05）②：剪贴板 + 快捷发送面板（移植自 XimeYi ximeyi-clipboard + 列表页面板）
+1. **新增 `xime-clipboard` crate**
+   - store.rs：SQLite 存储原样移植（表 `clipboard_entries`，`user_version=3` 对齐 Android Room v3；
+     按 text 去重刷新置顶、上限 1000/20、置顶不裁剪）；db 在 `~/.config/xime/clipboard.db`；测试 11 个
+   - watcher.rs：系统剪贴板监听（替代 macOS NSPasteboard 轮询）——独立 Wayland 连接 +
+     `ext-data-control-v1`（优先）/`zwlr-data-control-v1`（回退），事件驱动无轮询；
+     socketpair 接收 offer 文本（上限 1 MiB），text/plain;charset=utf-8 优先
+2. **xime-ui 列表页面板**（menu.rs / iced_view.rs）
+   - `PanelView::List { kind, items, highlighted }`，`ListKind::{Clipboard, QuickSend}`
+   - 几何：标题栏 40 + 5 行（28+4 间隔）+ 查看全部 30 = 230px；最小宽度 360
+   - `list_page_hit`：Back/Clear/More/Row{QuickSend,Remove,None}，绘制与点击共用几何；测试 4 个
+   - 渲染：置顶 ★ 标记、超宽截断 `truncate_to_width`（…）、行内 ＋/× 圆角按钮、空态文案
+   - `MenuAction::is_available()` 移除（4 个入口全部实现），置灰渲染逻辑删除
+3. **ImBackend::show_list_panel**（v1/v2）：仅设置 PanelView 状态，渲染随 show_candidate_window 生效
+4. **daemon 接线**
+   - main.rs：初始化 store + spawn watcher 线程（常驻）
+   - 菜单「剪切板/快捷发送」→ `PanelState::ListOpen(kind)`；空列表不开面板
+   - 键盘：Esc 返回菜单页、↑↓ 移动高亮、Return/Space/数字 1-5 提交上屏、普通按键自动收起列表正常输入
+   - 指针：行点击上屏（mark_consumed + update_timestamp）、＋ 加入快捷发送、× 删除、清空、← 菜单；
+     「查看全部」暂无动作（待 xime-setup 管理页）
+   - 提交/删除/清空后面板保持打开并重载列表；列表空时自动关闭
 
 ## 诊断记录（2026-08-28）：复制后某些窗口（QQ 最明显）无法输入中文
 **现象**：复制内容后在 QQ 聊天窗口打不了中文，托盘图标消失；需切到可输入窗口启用后才恢复。

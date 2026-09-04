@@ -125,3 +125,30 @@
 1. YAML 中 `14.0` 是浮点数，`serde_yaml` 严格类型检查
 2. `f32` 兼容整数和浮点数输入
 3. 后续可支持小数字号（如 14.5）
+## 2026-09-05: 候选栏主题样式与亮/暗色模式（移植自 macOS 版）
+
+**问题**：候选栏只有 primary_color 一个配置生效，字号/圆角硬编码；无暗色模式
+
+**决策**：
+1. `xime-ui` 新增 `PanelTheme`（字号/圆角/亮暗两套配色），渲染层全部 theme 驱动
+2. 亮/暗检测用 `org.freedesktop.portal.Settings` 的 color-scheme（DBus，KDE/GNOME 标准）
+3. `ImBackend` 接口直接传 `&PanelTheme`（而非拆散的颜色参数）
+4. 候选栏高度随字号自适应（≤16 保持 36px 不变，保证既有命中几何稳定）
+
+**理由**：
+1. 对齐 macOS 版 XimeYi 的 UiStyle + ui_colors 双模式设计
+2. portal 是跨桌面环境的官方接口，无需分别对接 kde/gtk settings
+3. theme 整体传递避免后续每加一个样式字段就改一遍 trait 签名
+
+## 2026-09-05: 剪贴板监听协议选型（data-control，非轮询/外部命令）
+
+**问题**：macOS 版靠轮询 `NSPasteboard.changeCount` 捕获剪贴板；Wayland 下没有等价物
+
+**决策**：后台线程 + 独立 Wayland 连接 + data-control 协议事件驱动监听；
+优先 `ext-data-control-unstable-v1`（标准暂定），回退 `zwlr-data-control-unstable-v1`
+
+**理由**：
+1. 符合项目「无框架依赖、一切自行掌控」原则（不依赖 wl-clipboard 外部命令）
+2. 事件驱动无轮询开销；文本读取用 socketpair + 1 MiB 上限防阻塞
+3. KDE（主目标环境）与 wlroots 系均支持；GNOME 两者皆无 → 自动捕获不可用（记录为已知限制，面板功能本身可用）
+4. 存储层原样移植 macOS 版：表结构对齐 Android（`clipboard_entries` v3），db 文件三端可互换

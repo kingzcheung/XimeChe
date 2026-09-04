@@ -122,6 +122,55 @@ impl ListPanel {
     }
 }
 
+/// 快捷发送编码注入状态（对齐 Android quick-send-demo 的"编码命中"语义）。
+///
+/// Rime 候选存在时：快捷发送条目**追加**在 Rime 当页候选之后（数字键超出
+/// Rime 候选数的部分由宿主接管）；Rime 无候选时：完全接管（高亮/翻行/回车）。
+#[derive(Debug, Default)]
+struct QuickSendInject {
+    /// 匹配到的 (code, text) 条目。
+    items: Vec<(String, String)>,
+    /// Rime 当页候选数（决定数字键归属）。
+    rime_count: usize,
+    /// Rime 无候选时（接管模式）的本地高亮。
+    highlighted: usize,
+}
+
+impl QuickSendInject {
+    fn active(&self) -> bool {
+        !self.items.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.rime_count = 0;
+        self.highlighted = 0;
+    }
+
+    /// 数字键位置（0 起）是否命中快捷发送条目；返回条目索引。
+    fn digit_hit(&self, pos: usize) -> Option<usize> {
+        pos.checked_sub(self.rime_count)
+            .filter(|&i| i < self.items.len())
+    }
+}
+
+/// 快捷发送编码前缀匹配（跳过无编码条目），最多 `limit` 条。
+fn match_quick_send_codes(
+    entries: &[(String, String)],
+    raw_input: &str,
+    limit: usize,
+) -> Vec<(String, String)> {
+    if raw_input.is_empty() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|(code, _)| code.starts_with(raw_input))
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
 /// 数字键 → 候选索引（1-9 对应 0-8，0 对应 9）。
 fn emoji_select_index(keysym: u32) -> Option<usize> {
     match keysym {
@@ -223,6 +272,7 @@ impl WaylandLoop {
             items: Vec::new(),
             highlighted: 0,
         };
+        let mut quick_send = QuickSendInject::default();
         let mut panel_state = PanelState::Closed;
         let mut last_panel_width: u32 = 0;
         let mut consumed_presses: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -373,6 +423,7 @@ impl WaylandLoop {
                         candidate_window_visible = false;
                         search_panel.active = false;
                         list_panel.active = false;
+                        quick_send.clear();
                         panel_state = PanelState::Closed;
                         ctrl_root_visible = false;
                         last_input_keysym = None;
@@ -389,6 +440,7 @@ impl WaylandLoop {
                         &mut plugin_host,
                         &mut search_panel,
                         &mut list_panel,
+                        &mut quick_send,
                         &mut panel_state,
                         &mut last_panel_width,
                         &xime_config,
@@ -430,6 +482,7 @@ impl WaylandLoop {
         plugin_host: &mut PluginHost,
         search_panel: &mut SearchPanel,
         list_panel: &mut ListPanel,
+        quick_send: &mut QuickSendInject,
         panel_state: &mut PanelState,
         last_panel_width: &mut u32,
         xime_config: &XimeConfig,
@@ -492,6 +545,7 @@ impl WaylandLoop {
                         plugin_host,
                         search_panel,
                         list_panel,
+                        quick_send,
                         panel_state,
                         last_panel_width,
                         xime_config,
@@ -519,6 +573,7 @@ impl WaylandLoop {
         plugin_host: &mut PluginHost,
         search_panel: &mut SearchPanel,
         list_panel: &mut ListPanel,
+        quick_send: &mut QuickSendInject,
         panel_state: &mut PanelState,
         last_panel_width: &mut u32,
         xime_config: &XimeConfig,
@@ -562,6 +617,7 @@ impl WaylandLoop {
                 *candidate_window_visible = false;
                 search_panel.active = false;
                 list_panel.active = false;
+                quick_send.clear();
                 *panel_state = PanelState::Closed;
                 *ctrl_root_visible = false;
                 *last_input_keysym = None;
@@ -638,6 +694,24 @@ impl WaylandLoop {
             theme,
             candidate_window_visible,
         ) {
+            return;
+        }
+
+        // 快捷发送编码注入：数字键/导航键按当前展示状态接管或落穿
+        if quick_send.active()
+            && self.handle_quick_send_key(
+                c,
+                rime,
+                plugin_host,
+                quick_send,
+                &event,
+                sym,
+                theme,
+                last_panel_width,
+                consumed_presses,
+                candidate_window_visible,
+            )
+        {
             return;
         }
 
@@ -722,6 +796,29 @@ impl WaylandLoop {
                 let _ = c.flush();
 
                 let menu = ctx.menu();
+                // 快捷发送编码匹配：原始输入 = preedit[..sel_start]
+                let comp = ctx.composition();
+                let raw_input = comp
+                    .preedit
+                    .and_then(|p| p.get(..comp.sel_start.min(p.len())))
+                    .unwrap_or("");
+                let matched: Vec<(String, String)> = if raw_input.is_empty() {
+                    Vec::new()
+                } else {
+                    let entries = self
+                        .clipboard
+                        .list_quick_send()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| !e.code.is_empty())
+                        .map(|e| (e.code, e.text))
+                        .collect::<Vec<_>>();
+                    match_quick_send_codes(&entries, raw_input, 9)
+                };
+                quick_send.items = matched;
+                quick_send.rime_count = menu.num_candidates;
+                quick_send.highlighted = 0;
+
                 if menu.num_candidates > 0 {
                     // candidate_count 配置限制展示条数（对齐 macOS 版 max_candidates）
                     let max_candidates = xime_config.style.candidate_count.clamp(1, 9) as usize;
@@ -740,9 +837,14 @@ impl WaylandLoop {
                             }
                         })
                         .collect();
-                    // 截断后重排索引（高亮索引在展示范围内不变）
-                    for (i, item) in candidate_items.iter_mut().enumerate() {
-                        item.index = i;
+                    // 快捷发送条目追加在 Rime 当页候选之后（数字键 9 位以内）
+                    let room = 9usize.saturating_sub(candidate_items.len());
+                    for (code, qs_text) in quick_send.items.iter().take(room) {
+                        candidate_items.push(xime_ui::CandidateItem {
+                            text: qs_text.clone(),
+                            comment: code.clone(),
+                            index: candidate_items.len(),
+                        });
                     }
                     let highlighted_index =
                         menu.highlighted_candidate_index.min(max_candidates - 1);
@@ -758,10 +860,26 @@ impl WaylandLoop {
                         *cache = Some((candidate_items.clone(), highlighted_index));
                     }
                     *candidate_window_visible = true;
-                } else if *candidate_window_visible {
-                    c.hide_candidate_window();
-                    let _ = c.flush();
-                    *candidate_window_visible = false;
+                } else if !quick_send.items.is_empty() {
+                    // Rime 无候选：宿主接管候选展示（快捷发送编码命中）
+                    self.render_quick_send(
+                        c,
+                        quick_send,
+                        theme,
+                        last_panel_width,
+                        candidate_window_visible,
+                    );
+                } else {
+                    quick_send.clear();
+                    if *candidate_window_visible {
+                        c.hide_candidate_window();
+                        let _ = c.flush();
+                        *candidate_window_visible = false;
+                        // 无候选时清空缓存，避免菜单重绘展示过期内容
+                        if let Ok(mut cache) = self.candidate_cache.lock() {
+                            *cache = None;
+                        }
+                    }
                 }
             }
         }
@@ -1416,6 +1534,183 @@ impl WaylandLoop {
         }
     }
 
+    // ── 快捷发送编码注入 ─────────────────────────────────────────────────
+
+    /// 快捷发送候选的接管渲染（Rime 无候选时）。
+    fn render_quick_send(
+        &self,
+        c: &mut dyn ImBackend,
+        quick_send: &QuickSendInject,
+        theme: &PanelTheme,
+        last_panel_width: &mut u32,
+        candidate_window_visible: &mut bool,
+    ) {
+        let candidate_items: Vec<xime_ui::CandidateItem> = quick_send
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (code, text))| xime_ui::CandidateItem {
+                text: text.clone(),
+                comment: code.clone(),
+                index: i,
+            })
+            .collect();
+        let highlighted_index = quick_send.highlighted.min(8);
+        if let Err(e) = c.show_candidate_window(&candidate_items, highlighted_index, theme) {
+            debug!("Quick send render error: {}", e);
+        }
+        *last_panel_width = c.candidate_width(&candidate_items, theme);
+        if let Ok(mut cache) = self.candidate_cache.lock() {
+            *cache = Some((candidate_items, highlighted_index));
+        }
+        let _ = c.flush();
+        *candidate_window_visible = true;
+    }
+
+    /// 提交快捷发送条目：上屏、清组合、退出注入状态。
+    #[allow(clippy::too_many_arguments)]
+    fn commit_quick_send(
+        &self,
+        c: &mut dyn ImBackend,
+        rime: &mut RimeEngine,
+        plugin_host: &PluginHost,
+        quick_send: &mut QuickSendInject,
+        index: usize,
+        candidate_window_visible: &mut bool,
+    ) {
+        let Some((_, text)) = quick_send.items.get(index) else {
+            return;
+        };
+        let text = text.clone();
+        c.commit_string(&text);
+        let _ = c.flush();
+        debug!("Quick send committed: {text}");
+        plugin_host.emit_text_committed(&text);
+        rime.clear_composition();
+        c.clear_preedit();
+        quick_send.clear();
+        if let Ok(mut cache) = self.candidate_cache.lock() {
+            *cache = None;
+        }
+        c.hide_candidate_window();
+        let _ = c.flush();
+        *candidate_window_visible = false;
+    }
+
+    /// 注入态按键处理。返回 true 表示按键已被宿主消费。
+    ///
+    /// - 数字键：位置超出 Rime 当页候选数时提交对应快捷发送条目，否则落穿给 Rime
+    /// - Rime 无候选（接管模式）：Return/Space 提交高亮、↑↓/←→/Tab 移动高亮、
+    ///   Escape 清组合退出
+    /// - 其余按键（含字母）：落穿给 Rime 正常处理
+    #[allow(clippy::too_many_arguments)]
+    fn handle_quick_send_key(
+        &self,
+        c: &mut dyn ImBackend,
+        rime: &mut RimeEngine,
+        plugin_host: &PluginHost,
+        quick_send: &mut QuickSendInject,
+        event: &xime_wayland::KeyEvent,
+        sym: Keysym,
+        theme: &PanelTheme,
+        last_panel_width: &mut u32,
+        consumed_presses: &mut std::collections::HashSet<u32>,
+        candidate_window_visible: &mut bool,
+    ) -> bool {
+        // 我们消费的按下，其释放一并吞掉（孤儿释放抑制）
+        if !event.pressed {
+            return consumed_presses.remove(&event.key);
+        }
+        let raw = sym.raw();
+
+        // 数字键归属判定
+        let digit_pos = match raw {
+            k @ (0x31..=0x39) => Some((k - 0x31) as usize),
+            0x30 => Some(9),
+            _ => None,
+        };
+        if let Some(pos) = digit_pos {
+            if let Some(index) = quick_send.digit_hit(pos) {
+                consumed_presses.insert(event.key);
+                self.commit_quick_send(
+                    c,
+                    rime,
+                    plugin_host,
+                    quick_send,
+                    index,
+                    candidate_window_visible,
+                );
+                return true;
+            }
+            // Rime 候选范围内的数字：正常选择（落穿）
+            return false;
+        }
+
+        // Rime 无候选：接管导航与提交键
+        if quick_send.rime_count == 0 {
+            match raw {
+                0xFF0D | 0xFF8D | 0x20 => {
+                    // Return / KP_Enter / Space：提交高亮
+                    consumed_presses.insert(event.key);
+                    let index = quick_send
+                        .highlighted
+                        .min(quick_send.items.len().saturating_sub(1));
+                    self.commit_quick_send(
+                        c,
+                        rime,
+                        plugin_host,
+                        quick_send,
+                        index,
+                        candidate_window_visible,
+                    );
+                    true
+                }
+                0xFF1B => {
+                    // Escape：清组合退出注入态
+                    quick_send.clear();
+                    rime.clear_composition();
+                    c.clear_preedit();
+                    c.hide_candidate_window();
+                    let _ = c.flush();
+                    if let Ok(mut cache) = self.candidate_cache.lock() {
+                        *cache = None;
+                    }
+                    *candidate_window_visible = false;
+                    true
+                }
+                0xFF52 | 0xFF51 => {
+                    // Up / Left：上一个
+                    quick_send.highlighted = quick_send.highlighted.saturating_sub(1);
+                    self.render_quick_send(
+                        c,
+                        quick_send,
+                        theme,
+                        last_panel_width,
+                        candidate_window_visible,
+                    );
+                    true
+                }
+                0xFF54 | 0xFF53 | 0xFF09 => {
+                    // Down / Right / Tab：下一个
+                    if quick_send.highlighted + 1 < quick_send.items.len() {
+                        quick_send.highlighted += 1;
+                    }
+                    self.render_quick_send(
+                        c,
+                        quick_send,
+                        theme,
+                        last_panel_width,
+                        candidate_window_visible,
+                    );
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
     /// 菜单开/关后重绘候选栏（复用最近一次候选内容，实现面板增高/恢复效果）。
     /// 无缓存时隐藏候选窗（面板内容模式且此前无候选的情况）。
     fn redraw_menu_candidates(
@@ -1555,6 +1850,53 @@ mod tests {
         // 10 的释放被抑制，但其他键不受影响
         assert!(!should_forward_key(false, false, &consumed, 10));
         assert!(should_forward_key(false, false, &consumed, 20));
+    }
+
+    fn qs_entries() -> Vec<(String, String)> {
+        vec![
+            ("dz".into(), "地址".into()),
+            ("dh".into(), "电话".into()),
+            ("dz2".into(), "地址2".into()),
+        ]
+    }
+
+    #[test]
+    fn test_match_quick_send_codes() {
+        // 空输入不匹配
+        assert!(match_quick_send_codes(&qs_entries(), "", 9).is_empty());
+        // 前缀匹配：dz 命中 2 条（按声明顺序）
+        let m = match_quick_send_codes(&qs_entries(), "dz", 9);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0], ("dz".to_string(), "地址".to_string()));
+        assert_eq!(m[1], ("dz2".to_string(), "地址2".to_string()));
+        // 精确 + 更长前缀
+        assert_eq!(match_quick_send_codes(&qs_entries(), "dh", 9).len(), 1);
+        assert!(match_quick_send_codes(&qs_entries(), "dzz", 9).is_empty());
+        // limit 截断
+        assert_eq!(match_quick_send_codes(&qs_entries(), "d", 2).len(), 2);
+    }
+
+    #[test]
+    fn test_quick_send_digit_hit() {
+        // rime_count = 5：数字 1-5（pos 0-4）属 Rime，6+（pos 5+）属快捷发送
+        let qs = QuickSendInject {
+            items: vec![("dz".into(), "地址".into()), ("dh".into(), "电话".into())],
+            rime_count: 5,
+            highlighted: 0,
+        };
+        assert_eq!(qs.digit_hit(0), None);
+        assert_eq!(qs.digit_hit(4), None);
+        assert_eq!(qs.digit_hit(5), Some(0));
+        assert_eq!(qs.digit_hit(6), Some(1));
+        assert_eq!(qs.digit_hit(7), None);
+        // 接管模式（rime_count = 0）：全部数字归宿主
+        let qs = QuickSendInject {
+            items: vec![("dz".into(), "地址".into())],
+            rime_count: 0,
+            highlighted: 0,
+        };
+        assert_eq!(qs.digit_hit(0), Some(0));
+        assert_eq!(qs.digit_hit(1), None);
     }
 
     #[test]

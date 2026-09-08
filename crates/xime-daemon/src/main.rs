@@ -34,7 +34,9 @@ fn init_tracing() -> WorkerGuard {
         }
     }
 
-    let file_appender = tracing_appender::rolling::never(&log_dir, "xime.log");
+    // 按天轮转，避免单文件无限增长；默认 INFO，需要 DEBUG 时用 RUST_LOG 覆盖
+    // （如 RUST_LOG=debug 或 RUST_LOG=cosmic_text=debug,xime_daemon=debug）。
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "xime.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = fmt::layer()
@@ -44,10 +46,10 @@ fn init_tracing() -> WorkerGuard {
 
     let stdout_layer = fmt::layer().with_writer(std::io::stderr).with_ansi(true);
 
-    let default_level = tracing::Level::DEBUG;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env().add_directive(default_level.into()))
+        .with(filter)
         .with(file_layer)
         .with(stdout_layer)
         .init();

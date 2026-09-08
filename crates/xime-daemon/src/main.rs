@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
         connection.request_name("org.xime.Xime").await?;
 
         info!("DBus service registered at org.xime.Xime");
-        info!("Tray icon registered");
+        info!("Tray registered (background retry if watcher was not up yet)");
         info!("Waiting for Wayland connection from launcher...");
 
         loop {

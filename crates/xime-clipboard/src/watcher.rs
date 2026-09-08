@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
 use wayland_client::protocol::{wl_registry, wl_seat};
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, event_created_child};
+use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::{
     self, ExtDataControlDeviceV1,
 };
@@ -224,14 +224,6 @@ fn capture_selection(
 
 // ── ext-data-control-unstable-v1 ─────────────────────────────────────────
 
-// data_offer 事件会创建新的 offer 对象：没有这个特化，wayland-client 会在
-// 派发到该事件时 panic（"Missing event_created_child specialization"），
-// 且 panic 发生在不可展开的调用栈里，直接 abort 整个进程（表现为
-// 复制内容后输入法整体崩溃退出）。
-event_created_child!(WatcherState, ExtDataControlDeviceV1, [
-    ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
-]);
-
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents, WatcherState> for WatcherState {
     fn event(
         _state: &mut Self,
@@ -291,6 +283,14 @@ impl Dispatch<ExtDataControlDeviceV1, (), WatcherState> for WatcherState {
             _ => {}
         }
     }
+
+    // data_offer 事件会创建新的 offer 对象：没有这个特化，wayland-client 会在
+    // 派发到该事件时 panic（"Missing event_created_child specialization"），
+    // 且 panic 发生在不可展开的调用栈里，直接 abort 整个进程（表现为
+    // 复制内容后输入法整体崩溃退出）。
+    event_created_child!(WatcherState, ExtDataControlDeviceV1, [
+        ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
+    ]);
 }
 
 impl Dispatch<ExtDataControlOfferV1, (), WatcherState> for WatcherState {
@@ -313,10 +313,6 @@ impl Dispatch<ExtDataControlOfferV1, (), WatcherState> for WatcherState {
 }
 
 // ── zwlr-data-control-unstable-v1（回退） ────────────────────────────────
-
-event_created_child!(WatcherState, ZwlrDataControlDeviceV1, [
-    zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ()),
-]);
 
 impl Dispatch<ZwlrDataControlManagerV1, (), WatcherState> for WatcherState {
     fn event(
@@ -353,6 +349,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, (), WatcherState> for WatcherState {
             _ => {}
         }
     }
+
+    event_created_child!(WatcherState, ZwlrDataControlDeviceV1, [
+        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ()),
+    ]);
 }
 
 impl Dispatch<ZwlrDataControlOfferV1, (), WatcherState> for WatcherState {

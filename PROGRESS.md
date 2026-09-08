@@ -1,10 +1,103 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**菜单面板升级为路由容器：表情/符号网格直接铺在面板区（不占候选栏），剪切板/快捷发送置灰**（2026-08-22）
+**插件系统应用扩展完成（参照 Android 版 Xime 的插件应用模式）**（2026-09-05）
+
+- 四个功能点：network.hosts 白名单强制、clipboard_sync 同步桥、
+  host.clipboard/quickSend 只读 API、text_committed 事件、快捷发送编码注入
+- libximecore 本地 patch（.cargo/config.toml）改了 xime-plugin crate，随 XimeChe 一起提交
+- 待实机验证：安装真实 webdav-clipboard-sync 插件跑通同步；快捷发送条目需先有 code
+  （面板 ＋ 按钮添加的条目 code 为空，编码管理 UI 待 xime-setup）
+
+## 本次变更（2026-09-05）③：插件系统应用扩展（参照 Android 版）
+1. **network.hosts 白名单强制**（libximecore xime-plugin，fail-closed）
+   - 未声明网络能力 → host.http.request 全部拒绝；声明 hosts → 仅白名单域名
+     （归一化比较：去 scheme/路径/端口、忽略大小写）；allowCustomHosts: true → 放行
+   - PluginRuntime::load 签名改为 manifest 驱动；测试 4 个（含 Lua 层拒绝路径）
+2. **clipboard_sync 同步桥**（daemon clipboard_sync.rs，对齐 Android ClipboardSyncBridge）
+   - 独立线程 SyncBridge：捕获 → push（SHA-256 hash 去重，profile 字段对齐
+     Android ClipboardProfile snake_case）；启动/ReloadPlugins/打开剪贴板面板 → pull
+     （回声抑制：跳过自己刚推送的 hash；远端条目 upsert_and_trim 入库）
+   - Lua 运行时在桥线程内创建；watcher 捕获经回调转发（spawn_watcher_with_callback）
+   - 模拟远端插件测试：push 去重/pull 回声抑制/重载 5 个
+3. **host.clipboard / host.quickSend 只读 API**（libximecore host_api.rs，能力门禁）
+   - ClipboardReadApi/QuickSendReadApi trait（宿主实现、运行时消费，依赖反转）
+   - manifest capabilities 强类型解析 RuntimeCaps；声明 clipboard_read/quick_send_read
+     且宿主提供实现才注入，否则 host.* 不可见；daemon 侧 ClipboardStore 适配器
+4. **text_committed 下行事件**（libximecore deliver_event + daemon 广播）
+   - 仅 manifest capabilities.events 订阅且实现 onPluginEvent 的插件被调用
+   - daemon 全部上屏路径广播：Rime 提交、表情/符号面板（键盘+点击）、
+     剪贴板/快捷发送列表提交（键盘+点击）
+5. **快捷发送编码注入候选栏**（daemon wayland.rs，对齐 Android quick-send-demo）
+   - Rime 当页候选后追加编码前缀命中条目（comment 显示编码，总位数 ≤9）；
+     数字键超出 Rime 候选数的部分宿主接管提交
+   - Rime 无候选时完全接管：高亮导航/Return/Space/Esc；字母键落穿 Rime
+   - 原始输入 = preedit[..sel_start]；孤儿释放抑制；无候选时清空候选缓存
+
+## 本次变更（2026-09-05）①：主题样式接入 + 亮/暗色模式（移植自 XimeYi UiStyle/ui_colors）
+1. **xime-ui 新增 `PanelTheme`**（theme.rs）
+   - 字号/圆角/高亮色 + 亮暗两套配色（亮 bg #F5F5F7/暗 bg #24262B，取自 macOS 版 ui_colors）
+   - `bar_height()`：候选栏高度随字号自适应（默认 ≤16 保持 36px 命中几何不变，大字号 2×字号+8，上限 72）
+   - iced_view 全部硬编码颜色/字号/圆角替换为 theme 驱动；高亮块圆角 = corner_radius-2
+2. **ImBackend 接口透传 theme**（v1/v2 同构）：show_candidate_window/show_root_window/candidate_width；
+   show_menu_panel 去掉无用的 color 参数；SHM buffer 高度按 bar_height + 面板高度计算
+3. **daemon**：从 xime.yaml 构建 theme（font_size/corner_radius/primary_color）；
+   `style.candidate_count`（clamp 1..9）限制展示条数；candidate_cache 改存候选+高亮（主题以当前值为准）
+4. **亮/暗色检测**：zbus 监听 `org.freedesktop.portal.Settings` 的 color-scheme（KDE/GNOME 标准接口），
+   变化 → `DaemonCommand::DarkMode(bool)` → 重建 theme + 候选栏可见时重绘；portal 不可用保持亮色
+5. **ReloadStyle 现在重建完整主题**（此前只有 primary_color 生效）
+6. 菜单/命中测试几何带 bar_height 参数（menu_button_hit/menu_item_hit/content_item_hit）
+
+## 本次变更（2026-09-05）②：剪贴板 + 快捷发送面板（移植自 XimeYi ximeyi-clipboard + 列表页面板）
+1. **新增 `xime-clipboard` crate**
+   - store.rs：SQLite 存储原样移植（表 `clipboard_entries`，`user_version=3` 对齐 Android Room v3；
+     按 text 去重刷新置顶、上限 1000/20、置顶不裁剪）；db 在 `~/.config/xime/clipboard.db`；测试 11 个
+   - watcher.rs：系统剪贴板监听（替代 macOS NSPasteboard 轮询）——独立 Wayland 连接 +
+     `ext-data-control-v1`（优先）/`zwlr-data-control-v1`（回退），事件驱动无轮询；
+     socketpair 接收 offer 文本（上限 1 MiB），text/plain;charset=utf-8 优先
+2. **xime-ui 列表页面板**（menu.rs / iced_view.rs）
+   - `PanelView::List { kind, items, highlighted }`，`ListKind::{Clipboard, QuickSend}`
+   - 几何：标题栏 40 + 5 行（28+4 间隔）+ 查看全部 30 = 230px；最小宽度 360
+   - `list_page_hit`：Back/Clear/More/Row{QuickSend,Remove,None}，绘制与点击共用几何；测试 4 个
+   - 渲染：置顶 ★ 标记、超宽截断 `truncate_to_width`（…）、行内 ＋/× 圆角按钮、空态文案
+   - `MenuAction::is_available()` 移除（4 个入口全部实现），置灰渲染逻辑删除
+3. **ImBackend::show_list_panel**（v1/v2）：仅设置 PanelView 状态，渲染随 show_candidate_window 生效
+4. **daemon 接线**
+   - main.rs：初始化 store + spawn watcher 线程（常驻）
+   - 菜单「剪切板/快捷发送」→ `PanelState::ListOpen(kind)`；空列表不开面板
+   - 键盘：Esc 返回菜单页、↑↓ 移动高亮、Return/Space/数字 1-5 提交上屏、普通按键自动收起列表正常输入
+   - 指针：行点击上屏（mark_consumed + update_timestamp）、＋ 加入快捷发送、× 删除、清空、← 菜单；
+     「查看全部」暂无动作（待 xime-setup 管理页）
+   - 提交/删除/清空后面板保持打开并重载列表；列表空时自动关闭
+
+## 诊断记录（2026-08-28）：复制后某些窗口（QQ 最明显）无法输入中文
+**现象**：复制内容后在 QQ 聊天窗口打不了中文，托盘图标消失；需切到可输入窗口启用后才恢复。
+
+**根因**（日志 + KWin 6.3.6 源码 + 客户端版本三方实锤）：
+1. 复制时点击消息气泡 → 输入框失焦 → QQ 的 Chromium 调 `text-input-v3.disable` → KWin 向 IM 发 DEACTIVATE（journal 可见 `State changed: active=false`，托盘 Passive，与"图标消失"吻合）
+2. 点回输入框后 QQ 本应重新 `enable`，但 **QQ 3.2.29 内置 Chromium 138 有 bug：disable 后不再重新 enable**（KWin bug 493098，Chromium 139 修复）；KWin `refreshActive()` 只认客户端 enable → 永不 ACTIVATE
+3. 切到其他窗口：那边的应用正常 enable → ACTIVATE 恢复；切回 QQ 时走窗口焦点切换路径才触发 QQ 重新 enable
+4. 对照组：VS Code（Chromium/148）正常、Brave 正常——只有旧 Chromium 应用中招
+5. journal 佐证：22:32:56 DEACTIVATE 后 15 秒零 ACTIVATE；当日 DEACTIVATE 386 次 vs ACTIVATE 773 次（双 context 异常比例）
+
+**KWin 侧验证过的死路**：DBus `org.kde.kwin.VirtualKeyboard.forceActivate()` 虽存在，但客户端 text-input 处于 disabled 时，KWin 会把中文 commit 丢弃（fake-key 路径仅支持少量 ASCII 键），故 daemon 侧无法单独恢复中文上屏。
+
+**用户级规避**：
+- 复制后在 QQ 内 alt-tab 切走再切回（触发 Chromium 焦点路径重新 enable），比切到"能打的窗口"更快
+- 等 QQ 升级到 Chromium ≥ 139 的版本；验证方法：`strings /opt/QQ/qq | grep -oE "Chrome/[0-9.]+" | head -1`
+
+**遗留可选功能**（未实现）：daemon 检测死锁态 → DBus forceActivate + zwp_virtual_keyboard 自定义 keymap 合成按键上屏中文（工作量大，需独立功能点）
 
 ## 本次变更（2026-08-22）
-1. **修复内容网格宽度不足**：单元格固定 36px 导致颜文字换行、排列错位
+**菜单面板升级为路由容器：表情/符号网格直接铺在面板区（不占候选栏），剪切板/快捷发送置灰**
+
+## 本次变更（2026-08-22）
+1. **Ctrl+Space 启停输入法**（fcitx 风格）
+   - 任意状态下 Ctrl+Space 切换全局启停开关（`im_enabled`）
+   - 停用：丢弃 rime 组合（`clear_composition` 原始 API）、清空 preedit、隐藏候选栏/菜单/Ctrl 字根、托盘显示英文
+   - 停用态按键直接转发不做处理（被消费按下的释放仍抑制，避免孤儿释放）；再次 Ctrl+Space 恢复
+   - rime-wubi 配置无 Ctrl+Space 绑定，此前该键被直接转发给应用（功能缺失）
+2. **修复内容网格宽度不足**：单元格固定 36px 导致颜文字换行、排列错位
    - 按最宽项估算单元格宽（`content_text_width`：ASCII 10px/CJK 17px/零宽组合符 0，保守偏大 +16 内边距）
    - 列数在 660px 上限内自适应（4..=10 列）；面板宽度随内容变化（颜文字页 7 列 ≈645px，纯符号 10 列 414px）
    - 单元格文本 `Wrapping::None` 禁止换行兜底；渲染/命中测试共用同一纯函数保证一致

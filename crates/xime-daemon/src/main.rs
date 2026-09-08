@@ -34,7 +34,9 @@ fn init_tracing() -> WorkerGuard {
         }
     }
 
-    let file_appender = tracing_appender::rolling::never(&log_dir, "xime.log");
+    // 按天轮转，避免单文件无限增长；默认 INFO，需要 DEBUG 时用 RUST_LOG 覆盖
+    // （如 RUST_LOG=debug 或 RUST_LOG=cosmic_text=debug,xime_daemon=debug）。
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "xime.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = fmt::layer()
@@ -44,10 +46,10 @@ fn init_tracing() -> WorkerGuard {
 
     let stdout_layer = fmt::layer().with_writer(std::io::stderr).with_ansi(true);
 
-    let default_level = tracing::Level::DEBUG;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env().add_directive(default_level.into()))
+        .with(filter)
         .with(file_layer)
         .with(stdout_layer)
         .init();
@@ -91,11 +93,37 @@ fn main() -> anyhow::Result<()> {
 
         let (command_tx, command_rx) = mpsc::channel();
 
+        // 剪贴板/快捷发送存储（SQLite，表结构对齐 Android）+ 系统剪贴板监听
+        // + 剪贴板同步桥（clipboard_sync 插件，独立线程避免网络阻塞按键）。
+        let clipboard_store = xime_clipboard::store::init(xime_clipboard::default_db_dir());
+        let (sync_tx, sync_rx) = mpsc::channel();
+        xime_daemon::spawn_bridge(clipboard_store.clone(), sync_rx);
+        let watcher_sync_tx = sync_tx.clone();
+        xime_clipboard::watcher::spawn_watcher_with_callback(
+            clipboard_store.clone(),
+            Some(Box::new(move |text| {
+                let _ = watcher_sync_tx.send(xime_daemon::SyncMessage::Captured(text.to_string()));
+            })),
+        );
+
+        // 系统亮/暗色模式监听（org.freedesktop.portal.Settings 的
+        // color-scheme，KDE/GNOME 均支持）。portal 不可用时保持亮色。
+        rt.spawn({
+            let connection = connection.clone();
+            let command_tx = command_tx.clone();
+            async move {
+                if let Err(e) = watch_color_scheme(connection, command_tx).await {
+                    debug!("Color scheme watcher unavailable: {}", e);
+                }
+            }
+        });
+
         thread::spawn({
             let tray = tray.clone();
             let rt_handle = rt_handle.clone();
             move || {
-                let wayland_loop = WaylandLoop::new(command_rx, tray, rt_handle);
+                let wayland_loop =
+                    WaylandLoop::new(command_rx, tray, rt_handle, clipboard_store, sync_tx);
                 wayland_loop.run();
             }
         });
@@ -110,7 +138,7 @@ fn main() -> anyhow::Result<()> {
         connection.request_name("org.xime.Xime").await?;
 
         info!("DBus service registered at org.xime.Xime");
-        info!("Tray icon registered");
+        info!("Tray registered (background retry if watcher was not up yet)");
         info!("Waiting for Wayland connection from launcher...");
 
         loop {
@@ -151,5 +179,47 @@ fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     })?;
 
+    Ok(())
+}
+
+/// 监听 portal 的 `color-scheme` 设置变化，向 daemon 发送 DarkMode 命令。
+/// 值语义：0 = 无偏好，1 = 偏好暗色，2 = 偏好亮色。
+async fn watch_color_scheme(
+    connection: Connection,
+    command_tx: mpsc::Sender<DaemonCommand>,
+) -> zbus::Result<()> {
+    use futures_lite::StreamExt;
+    use zbus::zvariant::OwnedValue;
+
+    let proxy = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Settings",
+    )
+    .await?;
+
+    // 初值：Read 返回 (v)，v 为 u32
+    let reply: (OwnedValue,) = proxy
+        .call("Read", &("org.freedesktop.appearance", "color-scheme"))
+        .await?;
+    if let Ok(mode) = reply.0.downcast_ref::<u32>() {
+        info!("System color scheme: mode={}", mode);
+        let _ = command_tx.send(DaemonCommand::DarkMode(mode == 1));
+    }
+
+    let mut changes = proxy.receive_signal("SettingChanged").await?;
+    while let Some(msg) = changes.next().await {
+        let Ok((namespace, key, value)) = msg.body().deserialize::<(String, String, OwnedValue)>()
+        else {
+            continue;
+        };
+        if namespace == "org.freedesktop.appearance" && key == "color-scheme" {
+            if let Ok(mode) = value.downcast_ref::<u32>() {
+                debug!("System color scheme changed: mode={}", mode);
+                let _ = command_tx.send(DaemonCommand::DarkMode(mode == 1));
+            }
+        }
+    }
     Ok(())
 }

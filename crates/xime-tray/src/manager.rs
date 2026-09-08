@@ -1,7 +1,8 @@
 use crate::sni::StatusNotifierItemSignals;
 use crate::{DBusMenu, InputMode, MenuAction, StatusNotifierItem};
+use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver};
-use tracing::debug;
+use tracing::{debug, warn};
 use zbus::object_server::InterfaceRef;
 use zbus::Connection;
 
@@ -39,6 +40,19 @@ impl TrayManager {
             .interface::<_, StatusNotifierItem>(SNI_OBJECT)
             .await?;
 
+        // 开机时 KWin 会先于 Plasma 托盘拉起输入法，此时 StatusNotifierWatcher
+        // 还没出现在总线上。注册失败不能让 daemon 退出（否则输入法"开机不自启"），
+        // 转入后台指数退避重试，托盘服务就绪后自动补注册。
+        if let Err(e) = Self::register_with_watcher(connection).await {
+            warn!("SNI watcher unavailable ({}), retrying in background", e);
+            Self::spawn_registration_retry(connection.clone());
+        } else {
+            debug!("SNI registered successfully (initially hidden)");
+        }
+        Ok((Self { sni_ref }, toggle_rx, action_rx))
+    }
+
+    async fn register_with_watcher(connection: &Connection) -> zbus::Result<()> {
         connection
             .call_method(
                 Some(SNI_WATCHER_SERVICE),
@@ -50,10 +64,25 @@ impl TrayManager {
                     .map(|n| n.to_string())
                     .unwrap_or_default()),
             )
-            .await?;
+            .await
+            .map(|_| ())
+    }
 
-        debug!("SNI registered successfully (initially hidden)");
-        Ok((Self { sni_ref }, toggle_rx, action_rx))
+    fn spawn_registration_retry(connection: Connection) {
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(15));
+                match Self::register_with_watcher(&connection).await {
+                    Ok(()) => {
+                        debug!("SNI registered successfully after retry");
+                        break;
+                    }
+                    Err(e) => debug!("SNI registration retry failed: {}", e),
+                }
+            }
+        });
     }
 
     pub async fn set_mode(&self, mode: InputMode) {

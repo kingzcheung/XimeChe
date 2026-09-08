@@ -3,13 +3,18 @@ use std::sync::Arc;
 use std::thread;
 
 use tracing::{debug, error, info};
+use xime_clipboard::store::now_millis;
+use xime_clipboard::store::ClipboardStore;
 use xime_config::XimeConfig;
 use xime_plugin::EmojiItem;
 use xime_tray::{InputMode, TrayManager};
+use xime_ui::PanelTheme;
+use xime_ui::{ListHit, ListItem, ListKind, ListRowButton};
 use xime_wayland::{connect_im_from_fd, connect_im_to_env, ImBackend};
 use xime_xkb::XkbContext;
 use xime_xkb::{keysym_to_letter, Keysym, ModifierState};
 
+use crate::clipboard_sync::{scan_descriptors, SyncMessage};
 use crate::{symbols, DaemonCommand, PluginHost, RimeEngine};
 
 /// 搜索面板模式。
@@ -44,6 +49,8 @@ enum PanelState {
     MenuOpen,
     /// 内容网格打开（表情/符号）。
     ContentOpen,
+    /// 列表页打开（剪贴板/快捷发送）。
+    ListOpen(ListKind),
 }
 
 impl Default for SearchPanel {
@@ -98,6 +105,72 @@ impl SearchPanel {
     }
 }
 
+/// 列表面板状态（剪贴板/快捷发送）：daemon 侧镜像，键盘选择用。
+struct ListPanel {
+    active: bool,
+    kind: ListKind,
+    items: Vec<ListItem>,
+    highlighted: usize,
+}
+
+impl ListPanel {
+    fn open(&mut self, kind: ListKind, items: Vec<ListItem>) {
+        self.active = true;
+        self.kind = kind;
+        self.items = items;
+        self.highlighted = 0;
+    }
+}
+
+/// 快捷发送编码注入状态（对齐 Android quick-send-demo 的"编码命中"语义）。
+///
+/// Rime 候选存在时：快捷发送条目**追加**在 Rime 当页候选之后（数字键超出
+/// Rime 候选数的部分由宿主接管）；Rime 无候选时：完全接管（高亮/翻行/回车）。
+#[derive(Debug, Default)]
+struct QuickSendInject {
+    /// 匹配到的 (code, text) 条目。
+    items: Vec<(String, String)>,
+    /// Rime 当页候选数（决定数字键归属）。
+    rime_count: usize,
+    /// Rime 无候选时（接管模式）的本地高亮。
+    highlighted: usize,
+}
+
+impl QuickSendInject {
+    fn active(&self) -> bool {
+        !self.items.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.rime_count = 0;
+        self.highlighted = 0;
+    }
+
+    /// 数字键位置（0 起）是否命中快捷发送条目；返回条目索引。
+    fn digit_hit(&self, pos: usize) -> Option<usize> {
+        pos.checked_sub(self.rime_count)
+            .filter(|&i| i < self.items.len())
+    }
+}
+
+/// 快捷发送编码前缀匹配（跳过无编码条目），最多 `limit` 条。
+fn match_quick_send_codes(
+    entries: &[(String, String)],
+    raw_input: &str,
+    limit: usize,
+) -> Vec<(String, String)> {
+    if raw_input.is_empty() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|(code, _)| code.starts_with(raw_input))
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
 /// 数字键 → 候选索引（1-9 对应 0-8，0 对应 9）。
 fn emoji_select_index(keysym: u32) -> Option<usize> {
     match keysym {
@@ -105,6 +178,16 @@ fn emoji_select_index(keysym: u32) -> Option<usize> {
         0x30 => Some(9),
         _ => None,
     }
+}
+
+/// 从配置构建渲染主题（亮/暗模式 + 字号/圆角/高亮色）。
+fn build_theme(config: &XimeConfig, dark: bool) -> PanelTheme {
+    PanelTheme::for_mode(
+        dark,
+        config.style.font_size,
+        config.style.corner_radius,
+        config.get_primary_color(),
+    )
 }
 
 /// 页内索引 → 实际提交文本（无保留位，索引 0 即当前页第一个）。
@@ -127,8 +210,8 @@ fn should_forward_key(
     !press_consumed && !release_of_consumed
 }
 
-/// 最近一次候选窗内容（菜单开/关后重绘用）。
-type CandidateCache = (Vec<xime_ui::CandidateItem>, usize, (u8, u8, u8));
+/// 最近一次候选窗内容（菜单开/关后重绘用，主题以当前值为准）。
+type CandidateCache = (Vec<xime_ui::CandidateItem>, usize);
 
 pub struct WaylandLoop {
     command_rx: Receiver<DaemonCommand>,
@@ -136,6 +219,10 @@ pub struct WaylandLoop {
     rt_handle: tokio::runtime::Handle,
     /// 最近一次候选内容缓存（菜单开/关后重绘用）。
     candidate_cache: std::sync::Mutex<Option<CandidateCache>>,
+    /// 剪贴板/快捷发送存储。
+    clipboard: Arc<ClipboardStore>,
+    /// 剪贴板同步桥命令通道。
+    sync_tx: std::sync::mpsc::Sender<SyncMessage>,
 }
 
 impl WaylandLoop {
@@ -143,12 +230,16 @@ impl WaylandLoop {
         command_rx: Receiver<DaemonCommand>,
         tray: Arc<TrayManager>,
         rt_handle: tokio::runtime::Handle,
+        clipboard: Arc<ClipboardStore>,
+        sync_tx: std::sync::mpsc::Sender<SyncMessage>,
     ) -> Self {
         Self {
             command_rx,
             tray,
             rt_handle,
             candidate_cache: std::sync::Mutex::new(None),
+            clipboard,
+            sync_tx,
         }
     }
 
@@ -158,13 +249,16 @@ impl WaylandLoop {
         let mut conn: Option<Box<dyn ImBackend>> = None;
         let mut xkb: Option<XkbContext> = None;
         let mut rime = RimeEngine::new();
-        let mut plugin_host = PluginHost::new();
+        let mut plugin_host = PluginHost::new(self.clipboard.clone());
         let mut xime_config = XimeConfig::load();
         let _last_key_root_binding = xime_config.get_last_key_root_binding();
         let primary_color = xime_config.get_primary_color();
         self.rt_handle.block_on(async {
             self.tray.set_primary_color(primary_color).await;
         });
+        // 渲染主题：配置样式 + 亮/暗模式（暗色由 portal 监听任务推送）。
+        let mut dark_mode = false;
+        let mut theme = build_theme(&xime_config, dark_mode);
         debug!(
             "Loaded hotkeys: show_key={}, primary_color={:?}",
             xime_config.wubi_radicals.hotkeys.show_key, primary_color
@@ -172,6 +266,13 @@ impl WaylandLoop {
 
         let mut candidate_window_visible = false;
         let mut search_panel = SearchPanel::default();
+        let mut list_panel = ListPanel {
+            active: false,
+            kind: ListKind::Clipboard,
+            items: Vec::new(),
+            highlighted: 0,
+        };
+        let mut quick_send = QuickSendInject::default();
         let mut panel_state = PanelState::Closed;
         let mut last_panel_width: u32 = 0;
         let mut consumed_presses: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -181,6 +282,12 @@ impl WaylandLoop {
         let mut last_active = false;
         // 输入法启停开关（Ctrl+Space 切换）：停用态按键直接转发，不做任何处理。
         let mut im_enabled = true;
+        // 暗色模式切换后待重绘标记（渲染需在 conn 作用域内进行）
+        let mut pending_theme_redraw = false;
+
+        // 剪贴板同步桥初始化：加载 clipboard_sync 插件并拉取一次
+        let _ = self.sync_tx.send(SyncMessage::Reload(scan_descriptors()));
+        let _ = self.sync_tx.send(SyncMessage::Pull);
 
         // 无 launcher 的会话（GNOME 等）：直接连接 $WAYLAND_DISPLAY 使用 v2 协议。
         // KWin 下普通 socket 不暴露 IM 协议，此步会失败，随后等待 launcher 传入 fd。
@@ -244,12 +351,23 @@ impl WaylandLoop {
                         self.tray.set_primary_color(new_color).await;
                     });
                     xime_config = new_config;
+                    theme = build_theme(&xime_config, dark_mode);
 
                     debug!("Style config reloaded, new primary_color={:?}", new_color);
+                }
+                Ok(DaemonCommand::DarkMode(dark)) => {
+                    debug!("DarkMode command received: dark={}", dark);
+                    dark_mode = dark;
+                    theme = build_theme(&xime_config, dark_mode);
+                    // 候选栏可见时标记重绘（渲染需在 conn 作用域内进行）
+                    pending_theme_redraw = true;
                 }
                 Ok(DaemonCommand::ReloadPlugins) => {
                     debug!("ReloadPlugins command received, reloading plugins...");
                     plugin_host.reload();
+                    // 同步桥：重载 clipboard_sync 插件并立即拉取一次
+                    let _ = self.sync_tx.send(SyncMessage::Reload(scan_descriptors()));
+                    let _ = self.sync_tx.send(SyncMessage::Pull);
                 }
                 Ok(DaemonCommand::SelectSchema(schema_id, result_tx)) => {
                     debug!("SelectSchema command received: {}", schema_id);
@@ -304,6 +422,8 @@ impl WaylandLoop {
                         let _ = c.flush();
                         candidate_window_visible = false;
                         search_panel.active = false;
+                        list_panel.active = false;
+                        quick_send.clear();
                         panel_state = PanelState::Closed;
                         ctrl_root_visible = false;
                         last_input_keysym = None;
@@ -319,9 +439,12 @@ impl WaylandLoop {
                         &mut rime,
                         &mut plugin_host,
                         &mut search_panel,
+                        &mut list_panel,
+                        &mut quick_send,
                         &mut panel_state,
                         &mut last_panel_width,
                         &xime_config,
+                        &theme,
                         &mut candidate_window_visible,
                         &mut consumed_presses,
                         &mut last_input_keysym,
@@ -330,6 +453,20 @@ impl WaylandLoop {
                         &mut im_enabled,
                     );
                 }
+
+                // 主题切换后的候选栏重绘（仅候选栏可见且面板未展开时）
+                if pending_theme_redraw {
+                    pending_theme_redraw = false;
+                    if candidate_window_visible && matches!(panel_state, PanelState::Closed) {
+                        self.redraw_menu_candidates(
+                            c.as_mut(),
+                            &theme,
+                            &mut candidate_window_visible,
+                        );
+                    }
+                }
+            } else {
+                pending_theme_redraw = false;
             }
 
             thread::sleep(std::time::Duration::from_millis(1));
@@ -344,9 +481,12 @@ impl WaylandLoop {
         rime: &mut RimeEngine,
         plugin_host: &mut PluginHost,
         search_panel: &mut SearchPanel,
+        list_panel: &mut ListPanel,
+        quick_send: &mut QuickSendInject,
         panel_state: &mut PanelState,
         last_panel_width: &mut u32,
         xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
         consumed_presses: &mut std::collections::HashSet<u32>,
         last_input_keysym: &mut Option<u32>,
@@ -379,9 +519,10 @@ impl WaylandLoop {
                 c,
                 plugin_host,
                 search_panel,
+                list_panel,
                 panel_state,
                 last_panel_width,
-                xime_config,
+                theme,
                 candidate_window_visible,
                 &pe,
             );
@@ -403,9 +544,12 @@ impl WaylandLoop {
                         rime,
                         plugin_host,
                         search_panel,
+                        list_panel,
+                        quick_send,
                         panel_state,
                         last_panel_width,
                         xime_config,
+                        theme,
                         event,
                         sym,
                         candidate_window_visible,
@@ -428,9 +572,12 @@ impl WaylandLoop {
         rime: &mut RimeEngine,
         plugin_host: &mut PluginHost,
         search_panel: &mut SearchPanel,
+        list_panel: &mut ListPanel,
+        quick_send: &mut QuickSendInject,
         panel_state: &mut PanelState,
         last_panel_width: &mut u32,
         xime_config: &XimeConfig,
+        theme: &PanelTheme,
         event: xime_wayland::KeyEvent,
         sym: Keysym,
         candidate_window_visible: &mut bool,
@@ -469,6 +616,8 @@ impl WaylandLoop {
                 let _ = c.flush();
                 *candidate_window_visible = false;
                 search_panel.active = false;
+                list_panel.active = false;
+                quick_send.clear();
                 *panel_state = PanelState::Closed;
                 *ctrl_root_visible = false;
                 *last_input_keysym = None;
@@ -507,8 +656,31 @@ impl WaylandLoop {
             debug!("Key pressed while menu open, closing panel");
             *panel_state = PanelState::Closed;
             c.hide_menu_panel();
-            self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+            self.redraw_menu_candidates(c, theme, candidate_window_visible);
             // 不转发：面板关闭后由后续按键处理正常输入
+        }
+
+        // 列表页（剪贴板/快捷发送）按键处理
+        if matches!(panel_state, PanelState::ListOpen(_)) && event.pressed {
+            if self.handle_list_key(
+                c,
+                plugin_host,
+                list_panel,
+                panel_state,
+                sym,
+                theme,
+                candidate_window_visible,
+            ) {
+                return;
+            }
+            // 未消费（如普通字符键）：关闭列表页，按键继续正常处理
+            list_panel.active = false;
+            *panel_state = PanelState::Closed;
+            c.hide_menu_panel();
+            self.redraw_menu_candidates(c, theme, candidate_window_visible);
+        } else if matches!(panel_state, PanelState::ListOpen(_)) {
+            // 释放事件由面板消费，不转发
+            return;
         }
 
         // emoji 面板：`;` 触发，面板激活时按键全部由面板消费。
@@ -519,9 +691,27 @@ impl WaylandLoop {
             panel_state,
             &event,
             sym,
-            xime_config,
+            theme,
             candidate_window_visible,
         ) {
+            return;
+        }
+
+        // 快捷发送编码注入：数字键/导航键按当前展示状态接管或落穿
+        if quick_send.active()
+            && self.handle_quick_send_key(
+                c,
+                rime,
+                plugin_host,
+                quick_send,
+                &event,
+                sym,
+                theme,
+                last_panel_width,
+                consumed_presses,
+                candidate_window_visible,
+            )
+        {
             return;
         }
 
@@ -530,6 +720,7 @@ impl WaylandLoop {
             && self.handle_ctrl_key(
                 c,
                 xime_config,
+                theme,
                 &event,
                 sym,
                 modifiers,
@@ -593,6 +784,7 @@ impl WaylandLoop {
                 c.commit_string(committed);
                 let _ = c.flush();
                 debug!("Committed: {}", committed);
+                plugin_host.emit_text_committed(committed);
             }
 
             if let Some(ctx) = session.context() {
@@ -604,10 +796,36 @@ impl WaylandLoop {
                 let _ = c.flush();
 
                 let menu = ctx.menu();
+                // 快捷发送编码匹配：原始输入 = preedit[..sel_start]
+                let comp = ctx.composition();
+                let raw_input = comp
+                    .preedit
+                    .and_then(|p| p.get(..comp.sel_start.min(p.len())))
+                    .unwrap_or("");
+                let matched: Vec<(String, String)> = if raw_input.is_empty() {
+                    Vec::new()
+                } else {
+                    let entries = self
+                        .clipboard
+                        .list_quick_send()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| !e.code.is_empty())
+                        .map(|e| (e.code, e.text))
+                        .collect::<Vec<_>>();
+                    match_quick_send_codes(&entries, raw_input, 9)
+                };
+                quick_send.items = matched;
+                quick_send.rime_count = menu.num_candidates;
+                quick_send.highlighted = 0;
+
                 if menu.num_candidates > 0 {
-                    let candidate_items: Vec<xime_ui::CandidateItem> = menu
+                    // candidate_count 配置限制展示条数（对齐 macOS 版 max_candidates）
+                    let max_candidates = xime_config.style.candidate_count.clamp(1, 9) as usize;
+                    let mut candidate_items: Vec<xime_ui::CandidateItem> = menu
                         .candidates
                         .iter()
+                        .take(max_candidates)
                         .enumerate()
                         .map(|(i, x)| {
                             let comment = x.comment.map(|c| c.to_string()).unwrap_or_default();
@@ -619,24 +837,49 @@ impl WaylandLoop {
                             }
                         })
                         .collect();
-                    let highlighted_index = menu.highlighted_candidate_index;
+                    // 快捷发送条目追加在 Rime 当页候选之后（数字键 9 位以内）
+                    let room = 9usize.saturating_sub(candidate_items.len());
+                    for (code, qs_text) in quick_send.items.iter().take(room) {
+                        candidate_items.push(xime_ui::CandidateItem {
+                            text: qs_text.clone(),
+                            comment: code.clone(),
+                            index: candidate_items.len(),
+                        });
+                    }
+                    let highlighted_index =
+                        menu.highlighted_candidate_index.min(max_candidates - 1);
                     debug!("highlighted_index={}", highlighted_index);
-                    let primary_color = xime_config.get_primary_color();
                     if let Err(e) =
-                        c.show_candidate_window(&candidate_items, highlighted_index, primary_color)
+                        c.show_candidate_window(&candidate_items, highlighted_index, theme)
                     {
                         debug!("Candidate window error: {}", e);
                     }
-                    *last_panel_width = c.candidate_width(&candidate_items);
+                    *last_panel_width = c.candidate_width(&candidate_items, theme);
                     // 缓存最近候选（菜单开/关后重绘）
                     if let Ok(mut cache) = self.candidate_cache.lock() {
-                        *cache = Some((candidate_items.clone(), highlighted_index, primary_color));
+                        *cache = Some((candidate_items.clone(), highlighted_index));
                     }
                     *candidate_window_visible = true;
-                } else if *candidate_window_visible {
-                    c.hide_candidate_window();
-                    let _ = c.flush();
-                    *candidate_window_visible = false;
+                } else if !quick_send.items.is_empty() {
+                    // Rime 无候选：宿主接管候选展示（快捷发送编码命中）
+                    self.render_quick_send(
+                        c,
+                        quick_send,
+                        theme,
+                        last_panel_width,
+                        candidate_window_visible,
+                    );
+                } else {
+                    quick_send.clear();
+                    if *candidate_window_visible {
+                        c.hide_candidate_window();
+                        let _ = c.flush();
+                        *candidate_window_visible = false;
+                        // 无候选时清空缓存，避免菜单重绘展示过期内容
+                        if let Ok(mut cache) = self.candidate_cache.lock() {
+                            *cache = None;
+                        }
+                    }
                 }
             }
         }
@@ -663,7 +906,7 @@ impl WaylandLoop {
         panel_state: &mut PanelState,
         event: &xime_wayland::KeyEvent,
         sym: Keysym,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) -> bool {
         if !event.pressed {
@@ -688,7 +931,7 @@ impl WaylandLoop {
                     plugin_host,
                     panel,
                     panel_state,
-                    xime_config,
+                    theme,
                     candidate_window_visible,
                 );
                 debug!("Emoji panel activated");
@@ -703,7 +946,7 @@ impl WaylandLoop {
                 panel.active = false;
                 *panel_state = PanelState::Closed;
                 c.hide_menu_panel();
-                self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                self.redraw_menu_candidates(c, theme, candidate_window_visible);
                 debug!("Search panel exited via Escape");
             }
             0xFF08 => {
@@ -714,7 +957,7 @@ impl WaylandLoop {
                     plugin_host,
                     panel,
                     panel_state,
-                    xime_config,
+                    theme,
                     candidate_window_visible,
                 );
             }
@@ -724,6 +967,7 @@ impl WaylandLoop {
                     c.commit_string(&text);
                     let _ = c.flush();
                     debug!("Panel committed: {}", text);
+                    plugin_host.emit_text_committed(&text);
                 }
             }
             0x3B => {
@@ -731,25 +975,26 @@ impl WaylandLoop {
                 c.commit_string(";");
                 let _ = c.flush();
                 debug!("Semicolon committed from panel");
+                plugin_host.emit_text_committed(";");
             }
             0xFF09 | 0xFF53 => {
                 // Tab / Right：高亮移动到下一个（页内循环）
                 let count = panel.page_len().max(1);
                 panel.highlighted = (panel.highlighted + 1) % count;
-                self.show_content(c, panel, xime_config, candidate_window_visible);
+                self.show_content(c, panel, theme, candidate_window_visible);
             }
             0xFF51 => {
                 // Left：高亮移动到上一个
                 let count = panel.page_len().max(1);
                 panel.highlighted = (panel.highlighted + count - 1) % count;
-                self.show_content(c, panel, xime_config, candidate_window_visible);
+                self.show_content(c, panel, theme, candidate_window_visible);
             }
             0xFF52 => {
                 // Up：上一页
                 if panel.page > 0 {
                     panel.page -= 1;
                     panel.highlighted = 0;
-                    self.show_content(c, panel, xime_config, candidate_window_visible);
+                    self.show_content(c, panel, theme, candidate_window_visible);
                 }
             }
             0xFF54 => {
@@ -757,7 +1002,7 @@ impl WaylandLoop {
                 if panel.page + 1 < panel.total_pages() {
                     panel.page += 1;
                     panel.highlighted = 0;
-                    self.show_content(c, panel, xime_config, candidate_window_visible);
+                    self.show_content(c, panel, theme, candidate_window_visible);
                 }
             }
             k if emoji_select_index(k).is_some() => {
@@ -767,6 +1012,7 @@ impl WaylandLoop {
                     c.commit_string(&text);
                     let _ = c.flush();
                     debug!("Panel committed by key {}: {}", k, text);
+                    plugin_host.emit_text_committed(&text);
                 }
             }
             k if (0x20..0x7F).contains(&k) => {
@@ -779,7 +1025,7 @@ impl WaylandLoop {
                     plugin_host,
                     panel,
                     panel_state,
-                    xime_config,
+                    theme,
                     candidate_window_visible,
                 );
             }
@@ -799,7 +1045,7 @@ impl WaylandLoop {
         plugin_host: &PluginHost,
         panel: &mut SearchPanel,
         panel_state: &mut PanelState,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) {
         // 表情取多页（最多 3 页）；符号表完整保留（分页浏览）
@@ -834,9 +1080,9 @@ impl WaylandLoop {
             panel.active = false;
             *panel_state = PanelState::Closed;
             c.hide_menu_panel();
-            self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+            self.redraw_menu_candidates(c, theme, candidate_window_visible);
         } else {
-            self.show_content(c, panel, xime_config, candidate_window_visible);
+            self.show_content(c, panel, theme, candidate_window_visible);
         }
     }
 
@@ -847,7 +1093,7 @@ impl WaylandLoop {
         &self,
         c: &mut dyn ImBackend,
         panel: &SearchPanel,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) {
         // 当前页切片
@@ -866,11 +1112,11 @@ impl WaylandLoop {
         }
         // 渲染：优先复用最近候选，无则空候选栏
         let cached = self.candidate_cache.lock().ok().and_then(|g| g.clone());
-        let (candidates, highlighted, primary_color) = match cached {
-            Some((cands, hi, col)) => (cands, hi, col),
-            None => (Vec::new(), 0usize, xime_config.get_primary_color()),
+        let (candidates, highlighted) = match cached {
+            Some((cands, hi)) => (cands, hi),
+            None => (Vec::new(), 0usize),
         };
-        if let Err(e) = c.show_candidate_window(&candidates, highlighted, primary_color) {
+        if let Err(e) = c.show_candidate_window(&candidates, highlighted, theme) {
             debug!("Content render candidate window error: {}", e);
         }
         let _ = c.flush();
@@ -884,9 +1130,10 @@ impl WaylandLoop {
         c: &mut dyn ImBackend,
         plugin_host: &mut PluginHost,
         search_panel: &mut SearchPanel,
+        list_panel: &mut ListPanel,
         panel_state: &mut PanelState,
         last_panel_width: &u32,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
         pe: &xime_wayland::PointerEvent,
     ) {
@@ -894,10 +1141,12 @@ impl WaylandLoop {
             PanelState::ContentOpen => {
                 // 内容网格：点击项直接上屏（面板保持打开，可连续选择）
                 let width = search_panel.panel_width().max(*last_panel_width);
+                let bar = theme.bar_height();
                 if let Some(idx) = xime_ui::content_item_hit(
                     pe.x,
                     pe.y,
                     width,
+                    bar,
                     search_panel.columns,
                     search_panel.page_len(),
                 ) {
@@ -905,31 +1154,54 @@ impl WaylandLoop {
                         c.commit_string(&text);
                         let _ = c.flush();
                         debug!("Content item committed: {}", text);
+                        plugin_host.emit_text_committed(&text);
                     }
                     return;
                 }
                 // 菜单按钮：路由回菜单视图
-                if xime_ui::menu_button_hit(pe.x, pe.y, width) {
+                if xime_ui::menu_button_hit(pe.x, pe.y, width, theme.bar_height()) {
                     debug!("Menu button clicked, routing back to menu");
-                    let primary_color = xime_config.get_primary_color();
-                    if let Err(e) = c.show_menu_panel(None, primary_color) {
+                    if let Err(e) = c.show_menu_panel(None) {
                         debug!("Failed to show menu panel: {}", e);
                     } else {
                         *panel_state = PanelState::MenuOpen;
-                        self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                        self.redraw_menu_candidates(c, theme, candidate_window_visible);
                     }
                 }
                 // 其他区域（候选栏空白）：忽略
             }
             PanelState::MenuOpen => {
-                // 面板在候选栏下方展开：y >= 36 是面板区
-                if pe.y >= xime_ui::CANDIDATE_HEIGHT as i32 {
+                // 面板在候选栏下方展开：y >= 候选栏高度是面板区
+                let bar = theme.bar_height();
+                if pe.y >= bar as i32 {
                     // 点击面板入口
-                    if let Some(action) = xime_ui::menu_item_hit(pe.x, pe.y, *last_panel_width) {
+                    if let Some(action) = xime_ui::menu_item_hit(pe.x, pe.y, *last_panel_width, bar)
+                    {
                         debug!("Menu item clicked: {:?}", action);
-                        if !action.is_available() {
-                            // 未实现的功能：保持菜单打开，不做任何事
-                            debug!("Menu item {:?} not implemented, keeping menu open", action);
+                        if matches!(
+                            action,
+                            xime_ui::MenuAction::Clipboard | xime_ui::MenuAction::QuickSend
+                        ) {
+                            // 路由到列表页（剪贴板/快捷发送）
+                            let kind = if action == xime_ui::MenuAction::QuickSend {
+                                ListKind::QuickSend
+                            } else {
+                                ListKind::Clipboard
+                            };
+                            *panel_state = PanelState::Closed;
+                            c.hide_menu_panel();
+                            let items = self.load_list_items(kind);
+                            if items.is_empty() {
+                                self.redraw_menu_candidates(c, theme, candidate_window_visible);
+                                debug!("List panel ({kind:?}) opened but empty, keeping closed");
+                                return;
+                            }
+                            list_panel.open(kind, items);
+                            *panel_state = PanelState::ListOpen(kind);
+                            self.show_list(c, list_panel, theme, candidate_window_visible);
+                            // 打开剪贴板面板时拉取一次远端（对齐 Android pullOnce 语义）
+                            let _ = self.sync_tx.send(SyncMessage::Pull);
+                            debug!("List panel opened from menu: {kind:?}");
                             return;
                         }
                         *panel_state = PanelState::Closed;
@@ -940,11 +1212,7 @@ impl WaylandLoop {
                                 plugin_host.reload();
                                 if plugin_host.emoji_plugin_count() == 0 {
                                     debug!("Emoji menu click but no emoji plugins loaded");
-                                    self.redraw_menu_candidates(
-                                        c,
-                                        xime_config,
-                                        candidate_window_visible,
-                                    );
+                                    self.redraw_menu_candidates(c, theme, candidate_window_visible);
                                     return;
                                 }
                                 search_panel.open(PanelMode::Emoji);
@@ -961,7 +1229,7 @@ impl WaylandLoop {
                             plugin_host,
                             search_panel,
                             panel_state,
-                            xime_config,
+                            theme,
                             candidate_window_visible,
                         );
                         debug!("Content panel opened from menu: {:?}", search_panel.mode);
@@ -970,30 +1238,476 @@ impl WaylandLoop {
                     // 面板内但未命中入口：关闭
                     *panel_state = PanelState::Closed;
                     c.hide_menu_panel();
-                    self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                    self.redraw_menu_candidates(c, theme, candidate_window_visible);
                 } else {
                     // 点击候选栏区域
-                    if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width) {
+                    if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width, bar) {
                         *panel_state = PanelState::Closed;
                         c.hide_menu_panel();
-                        self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                        self.redraw_menu_candidates(c, theme, candidate_window_visible);
                         debug!("Menu button clicked, closing panel");
+                    }
+                }
+            }
+            PanelState::ListOpen(kind) => {
+                let width = (*last_panel_width).max(xime_ui::LIST_MIN_PANEL_WIDTH);
+                let bar = theme.bar_height();
+                let is_quick_send = *kind == ListKind::QuickSend;
+                let hit = xime_ui::list_page_hit(
+                    pe.x,
+                    pe.y,
+                    width,
+                    bar,
+                    list_panel.items.len(),
+                    is_quick_send,
+                );
+                match hit {
+                    Some(ListHit::Back) => {
+                        debug!("List panel: back to menu");
+                        list_panel.active = false;
+                        if let Err(e) = c.show_menu_panel(None) {
+                            debug!("Failed to show menu panel: {}", e);
+                        } else {
+                            *panel_state = PanelState::MenuOpen;
+                            self.redraw_menu_candidates(c, theme, candidate_window_visible);
+                        }
+                    }
+                    Some(ListHit::Clear) => {
+                        debug!("List panel: clear all ({kind:?})");
+                        let result = if is_quick_send {
+                            self.clipboard.clear_quick_send()
+                        } else {
+                            self.clipboard.clear_clipboard()
+                        };
+                        if let Err(e) = result {
+                            debug!("List clear failed: {e}");
+                        }
+                        self.reload_and_show_list(
+                            c,
+                            list_panel,
+                            panel_state,
+                            theme,
+                            candidate_window_visible,
+                        );
+                    }
+                    Some(ListHit::More) => {
+                        // "查看全部"：管理入口暂未实现（待 xime-setup 管理页）
+                        debug!("List panel: more items not implemented");
+                    }
+                    Some(ListHit::Row { index, button }) => match button {
+                        Some(ListRowButton::QuickSend) => {
+                            if let Some(item) = list_panel.items.get(index) {
+                                debug!("List panel: add to quick send id={}", item.id);
+                                if let Err(e) =
+                                    self.clipboard.add_to_quick_send(item.id, now_millis())
+                                {
+                                    debug!("Add to quick send failed: {e}");
+                                }
+                            }
+                        }
+                        Some(ListRowButton::Remove) => {
+                            if let Some(item) = list_panel.items.get(index) {
+                                debug!("List panel: remove id={}", item.id);
+                                let result = if is_quick_send {
+                                    self.clipboard.delete_quick_send(item.id)
+                                } else {
+                                    self.clipboard.delete_clipboard(item.id)
+                                };
+                                if let Err(e) = result {
+                                    debug!("List remove failed: {e}");
+                                }
+                            }
+                            self.reload_and_show_list(
+                                c,
+                                list_panel,
+                                panel_state,
+                                theme,
+                                candidate_window_visible,
+                            );
+                        }
+                        None => {
+                            self.commit_list_item(
+                                c,
+                                plugin_host,
+                                list_panel,
+                                panel_state,
+                                index,
+                                theme,
+                                candidate_window_visible,
+                            );
+                        }
+                    },
+                    None => {
+                        // 面板外区域（候选栏）：菜单按钮开合
+                        if pe.y < bar as i32
+                            && xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width, bar)
+                        {
+                            debug!("Menu button clicked, closing list panel");
+                            list_panel.active = false;
+                            *panel_state = PanelState::Closed;
+                            c.hide_menu_panel();
+                            self.redraw_menu_candidates(c, theme, candidate_window_visible);
+                        }
                     }
                 }
             }
             PanelState::Closed => {
                 // 候选栏最右侧按钮区域
-                if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width) {
+                if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width, theme.bar_height()) {
                     debug!("Menu button clicked, opening panel");
-                    let primary_color = xime_config.get_primary_color();
-                    if let Err(e) = c.show_menu_panel(None, primary_color) {
+                    if let Err(e) = c.show_menu_panel(None) {
                         debug!("Failed to show menu panel: {}", e);
                     } else {
                         *panel_state = PanelState::MenuOpen;
-                        self.redraw_menu_candidates(c, xime_config, candidate_window_visible);
+                        self.redraw_menu_candidates(c, theme, candidate_window_visible);
                     }
                 }
             }
+        }
+    }
+
+    // ── 列表页面板（剪贴板/快捷发送） ────────────────────────────────────
+
+    /// 从存储加载列表页条目（渲染上限 LIST_LIMIT 行）。
+    fn load_list_items(&self, kind: ListKind) -> Vec<ListItem> {
+        let entries = if kind == ListKind::QuickSend {
+            self.clipboard.list_quick_send()
+        } else {
+            self.clipboard.list_clipboard(xime_ui::LIST_LIMIT as i64)
+        };
+        entries
+            .unwrap_or_default()
+            .into_iter()
+            .take(xime_ui::LIST_LIMIT)
+            .map(|e| ListItem {
+                id: e.id,
+                text: e.text,
+                is_pinned: e.is_pinned,
+            })
+            .collect()
+    }
+
+    /// 渲染列表页当前状态（复用最近候选栏内容撑底）。
+    fn show_list(
+        &self,
+        c: &mut dyn ImBackend,
+        list: &ListPanel,
+        theme: &PanelTheme,
+        candidate_window_visible: &mut bool,
+    ) {
+        if let Err(e) = c.show_list_panel(list.kind, &list.items, Some(list.highlighted)) {
+            debug!("List panel error: {}", e);
+        }
+        let cached = self.candidate_cache.lock().ok().and_then(|g| g.clone());
+        let (candidates, highlighted) = cached.unwrap_or_else(|| (Vec::new(), 0usize));
+        if let Err(e) = c.show_candidate_window(&candidates, highlighted, theme) {
+            debug!("List render candidate window error: {}", e);
+        }
+        let _ = c.flush();
+        *candidate_window_visible = true;
+    }
+
+    /// 变更后重载条目并重渲染；条目为空时关闭列表页。
+    fn reload_and_show_list(
+        &self,
+        c: &mut dyn ImBackend,
+        list: &mut ListPanel,
+        panel_state: &mut PanelState,
+        theme: &PanelTheme,
+        candidate_window_visible: &mut bool,
+    ) {
+        list.items = self.load_list_items(list.kind);
+        if list.items.is_empty() {
+            list.active = false;
+            *panel_state = PanelState::Closed;
+            c.hide_menu_panel();
+            self.redraw_menu_candidates(c, theme, candidate_window_visible);
+        } else {
+            list.highlighted = list.highlighted.min(list.items.len() - 1);
+            self.show_list(c, list, theme, candidate_window_visible);
+        }
+    }
+
+    /// 提交列表条目：上屏文本 + 标记消费 + 刷新时间戳，面板保持打开。
+    #[allow(clippy::too_many_arguments)]
+    fn commit_list_item(
+        &self,
+        c: &mut dyn ImBackend,
+        plugin_host: &PluginHost,
+        list: &mut ListPanel,
+        panel_state: &mut PanelState,
+        index: usize,
+        theme: &PanelTheme,
+        candidate_window_visible: &mut bool,
+    ) {
+        let Some(item) = list.items.get(index) else {
+            return;
+        };
+        let id = item.id;
+        if let Ok(Some(entry)) = self.clipboard.find_by_id(id) {
+            c.commit_string(&entry.text);
+            let _ = c.flush();
+            debug!("List item committed: {}", entry.text);
+            let _ = self.clipboard.mark_consumed(id);
+            let _ = self.clipboard.update_timestamp(id, now_millis());
+            plugin_host.emit_text_committed(&entry.text);
+        }
+        self.reload_and_show_list(c, list, panel_state, theme, candidate_window_visible);
+    }
+
+    /// 列表页按键处理。返回 true 表示按键已被消费。
+    ///
+    /// - Escape：返回菜单页
+    /// - Up/Down：移动高亮
+    /// - Return/Space/数字键：提交对应条目（面板保持打开）
+    /// - 其他按键：返回 false（调用方关闭列表页并正常处理）
+    #[allow(clippy::too_many_arguments)]
+    fn handle_list_key(
+        &self,
+        c: &mut dyn ImBackend,
+        plugin_host: &PluginHost,
+        list: &mut ListPanel,
+        panel_state: &mut PanelState,
+        sym: Keysym,
+        theme: &PanelTheme,
+        candidate_window_visible: &mut bool,
+    ) -> bool {
+        let raw = sym.raw();
+        match raw {
+            0xFF1B => {
+                // Escape：返回菜单页
+                debug!("List panel exited to menu via Escape");
+                list.active = false;
+                if let Err(e) = c.show_menu_panel(None) {
+                    debug!("Failed to show menu panel: {}", e);
+                } else {
+                    *panel_state = PanelState::MenuOpen;
+                }
+                self.redraw_menu_candidates(c, theme, candidate_window_visible);
+                true
+            }
+            0xFF52 => {
+                // Up：上一个
+                if list.highlighted > 0 {
+                    list.highlighted -= 1;
+                    self.show_list(c, list, theme, candidate_window_visible);
+                }
+                true
+            }
+            0xFF54 => {
+                // Down：下一个
+                if list.highlighted + 1 < list.items.len() {
+                    list.highlighted += 1;
+                    self.show_list(c, list, theme, candidate_window_visible);
+                }
+                true
+            }
+            0xFF0D | 0xFF8D | 0x20 => {
+                // Return / KP_Enter / Space：提交高亮条目
+                let index = list.highlighted;
+                self.commit_list_item(
+                    c,
+                    plugin_host,
+                    list,
+                    panel_state,
+                    index,
+                    theme,
+                    candidate_window_visible,
+                );
+                true
+            }
+            k if (0x31..=0x35).contains(&k) => {
+                // 数字键 1-5：提交对应行
+                let index = (k - 0x31) as usize;
+                self.commit_list_item(
+                    c,
+                    plugin_host,
+                    list,
+                    panel_state,
+                    index,
+                    theme,
+                    candidate_window_visible,
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // ── 快捷发送编码注入 ─────────────────────────────────────────────────
+
+    /// 快捷发送候选的接管渲染（Rime 无候选时）。
+    fn render_quick_send(
+        &self,
+        c: &mut dyn ImBackend,
+        quick_send: &QuickSendInject,
+        theme: &PanelTheme,
+        last_panel_width: &mut u32,
+        candidate_window_visible: &mut bool,
+    ) {
+        let candidate_items: Vec<xime_ui::CandidateItem> = quick_send
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (code, text))| xime_ui::CandidateItem {
+                text: text.clone(),
+                comment: code.clone(),
+                index: i,
+            })
+            .collect();
+        let highlighted_index = quick_send.highlighted.min(8);
+        if let Err(e) = c.show_candidate_window(&candidate_items, highlighted_index, theme) {
+            debug!("Quick send render error: {}", e);
+        }
+        *last_panel_width = c.candidate_width(&candidate_items, theme);
+        if let Ok(mut cache) = self.candidate_cache.lock() {
+            *cache = Some((candidate_items, highlighted_index));
+        }
+        let _ = c.flush();
+        *candidate_window_visible = true;
+    }
+
+    /// 提交快捷发送条目：上屏、清组合、退出注入状态。
+    #[allow(clippy::too_many_arguments)]
+    fn commit_quick_send(
+        &self,
+        c: &mut dyn ImBackend,
+        rime: &mut RimeEngine,
+        plugin_host: &PluginHost,
+        quick_send: &mut QuickSendInject,
+        index: usize,
+        candidate_window_visible: &mut bool,
+    ) {
+        let Some((_, text)) = quick_send.items.get(index) else {
+            return;
+        };
+        let text = text.clone();
+        c.commit_string(&text);
+        let _ = c.flush();
+        debug!("Quick send committed: {text}");
+        plugin_host.emit_text_committed(&text);
+        rime.clear_composition();
+        c.clear_preedit();
+        quick_send.clear();
+        if let Ok(mut cache) = self.candidate_cache.lock() {
+            *cache = None;
+        }
+        c.hide_candidate_window();
+        let _ = c.flush();
+        *candidate_window_visible = false;
+    }
+
+    /// 注入态按键处理。返回 true 表示按键已被宿主消费。
+    ///
+    /// - 数字键：位置超出 Rime 当页候选数时提交对应快捷发送条目，否则落穿给 Rime
+    /// - Rime 无候选（接管模式）：Return/Space 提交高亮、↑↓/←→/Tab 移动高亮、
+    ///   Escape 清组合退出
+    /// - 其余按键（含字母）：落穿给 Rime 正常处理
+    #[allow(clippy::too_many_arguments)]
+    fn handle_quick_send_key(
+        &self,
+        c: &mut dyn ImBackend,
+        rime: &mut RimeEngine,
+        plugin_host: &PluginHost,
+        quick_send: &mut QuickSendInject,
+        event: &xime_wayland::KeyEvent,
+        sym: Keysym,
+        theme: &PanelTheme,
+        last_panel_width: &mut u32,
+        consumed_presses: &mut std::collections::HashSet<u32>,
+        candidate_window_visible: &mut bool,
+    ) -> bool {
+        // 我们消费的按下，其释放一并吞掉（孤儿释放抑制）
+        if !event.pressed {
+            return consumed_presses.remove(&event.key);
+        }
+        let raw = sym.raw();
+
+        // 数字键归属判定
+        let digit_pos = match raw {
+            k @ (0x31..=0x39) => Some((k - 0x31) as usize),
+            0x30 => Some(9),
+            _ => None,
+        };
+        if let Some(pos) = digit_pos {
+            if let Some(index) = quick_send.digit_hit(pos) {
+                consumed_presses.insert(event.key);
+                self.commit_quick_send(
+                    c,
+                    rime,
+                    plugin_host,
+                    quick_send,
+                    index,
+                    candidate_window_visible,
+                );
+                return true;
+            }
+            // Rime 候选范围内的数字：正常选择（落穿）
+            return false;
+        }
+
+        // Rime 无候选：接管导航与提交键
+        if quick_send.rime_count == 0 {
+            match raw {
+                0xFF0D | 0xFF8D | 0x20 => {
+                    // Return / KP_Enter / Space：提交高亮
+                    consumed_presses.insert(event.key);
+                    let index = quick_send
+                        .highlighted
+                        .min(quick_send.items.len().saturating_sub(1));
+                    self.commit_quick_send(
+                        c,
+                        rime,
+                        plugin_host,
+                        quick_send,
+                        index,
+                        candidate_window_visible,
+                    );
+                    true
+                }
+                0xFF1B => {
+                    // Escape：清组合退出注入态
+                    quick_send.clear();
+                    rime.clear_composition();
+                    c.clear_preedit();
+                    c.hide_candidate_window();
+                    let _ = c.flush();
+                    if let Ok(mut cache) = self.candidate_cache.lock() {
+                        *cache = None;
+                    }
+                    *candidate_window_visible = false;
+                    true
+                }
+                0xFF52 | 0xFF51 => {
+                    // Up / Left：上一个
+                    quick_send.highlighted = quick_send.highlighted.saturating_sub(1);
+                    self.render_quick_send(
+                        c,
+                        quick_send,
+                        theme,
+                        last_panel_width,
+                        candidate_window_visible,
+                    );
+                    true
+                }
+                0xFF54 | 0xFF53 | 0xFF09 => {
+                    // Down / Right / Tab：下一个
+                    if quick_send.highlighted + 1 < quick_send.items.len() {
+                        quick_send.highlighted += 1;
+                    }
+                    self.render_quick_send(
+                        c,
+                        quick_send,
+                        theme,
+                        last_panel_width,
+                        candidate_window_visible,
+                    );
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
         }
     }
 
@@ -1002,13 +1716,12 @@ impl WaylandLoop {
     fn redraw_menu_candidates(
         &self,
         c: &mut dyn ImBackend,
-        xime_config: &XimeConfig,
+        theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) {
         let cached = self.candidate_cache.lock().ok().and_then(|g| g.clone());
-        if let Some((candidates, highlighted, _)) = cached {
-            let primary_color = xime_config.get_primary_color();
-            if let Err(e) = c.show_candidate_window(&candidates, highlighted, primary_color) {
+        if let Some((candidates, highlighted)) = cached {
+            if let Err(e) = c.show_candidate_window(&candidates, highlighted, theme) {
                 debug!("Menu redraw candidate window error: {}", e);
             }
             let _ = c.flush();
@@ -1026,6 +1739,7 @@ impl WaylandLoop {
         &self,
         c: &mut dyn ImBackend,
         xime_config: &XimeConfig,
+        theme: &PanelTheme,
         event: &xime_wayland::KeyEvent,
         _sym: Keysym,
         modifiers: ModifierState,
@@ -1050,8 +1764,7 @@ impl WaylandLoop {
                         debug!("root for '{}' (schema={}) = {:?}", letter, schema, root);
                         if let Some(root) = root {
                             debug!("Ctrl pressed, showing root for '{}': {}", letter, root);
-                            let primary_color = xime_config.get_primary_color();
-                            if let Err(e) = c.show_root_window(letter, &root, primary_color) {
+                            if let Err(e) = c.show_root_window(letter, &root, theme) {
                                 debug!("Failed to show root window: {}", e);
                             } else {
                                 *ctrl_root_visible = true;
@@ -1083,12 +1796,9 @@ impl WaylandLoop {
                             })
                             .collect();
                         let highlighted_index = menu.highlighted_candidate_index;
-                        let primary_color = xime_config.get_primary_color();
-                        if let Err(e) = c.show_candidate_window(
-                            &candidate_items,
-                            highlighted_index,
-                            primary_color,
-                        ) {
+                        if let Err(e) =
+                            c.show_candidate_window(&candidate_items, highlighted_index, theme)
+                        {
                             debug!("Failed to restore candidate window: {}", e);
                         }
                         if let Err(e) = c.flush() {
@@ -1140,6 +1850,53 @@ mod tests {
         // 10 的释放被抑制，但其他键不受影响
         assert!(!should_forward_key(false, false, &consumed, 10));
         assert!(should_forward_key(false, false, &consumed, 20));
+    }
+
+    fn qs_entries() -> Vec<(String, String)> {
+        vec![
+            ("dz".into(), "地址".into()),
+            ("dh".into(), "电话".into()),
+            ("dz2".into(), "地址2".into()),
+        ]
+    }
+
+    #[test]
+    fn test_match_quick_send_codes() {
+        // 空输入不匹配
+        assert!(match_quick_send_codes(&qs_entries(), "", 9).is_empty());
+        // 前缀匹配：dz 命中 2 条（按声明顺序）
+        let m = match_quick_send_codes(&qs_entries(), "dz", 9);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0], ("dz".to_string(), "地址".to_string()));
+        assert_eq!(m[1], ("dz2".to_string(), "地址2".to_string()));
+        // 精确 + 更长前缀
+        assert_eq!(match_quick_send_codes(&qs_entries(), "dh", 9).len(), 1);
+        assert!(match_quick_send_codes(&qs_entries(), "dzz", 9).is_empty());
+        // limit 截断
+        assert_eq!(match_quick_send_codes(&qs_entries(), "d", 2).len(), 2);
+    }
+
+    #[test]
+    fn test_quick_send_digit_hit() {
+        // rime_count = 5：数字 1-5（pos 0-4）属 Rime，6+（pos 5+）属快捷发送
+        let qs = QuickSendInject {
+            items: vec![("dz".into(), "地址".into()), ("dh".into(), "电话".into())],
+            rime_count: 5,
+            highlighted: 0,
+        };
+        assert_eq!(qs.digit_hit(0), None);
+        assert_eq!(qs.digit_hit(4), None);
+        assert_eq!(qs.digit_hit(5), Some(0));
+        assert_eq!(qs.digit_hit(6), Some(1));
+        assert_eq!(qs.digit_hit(7), None);
+        // 接管模式（rime_count = 0）：全部数字归宿主
+        let qs = QuickSendInject {
+            items: vec![("dz".into(), "地址".into())],
+            rime_count: 0,
+            highlighted: 0,
+        };
+        assert_eq!(qs.digit_hit(0), Some(0));
+        assert_eq!(qs.digit_hit(1), None);
     }
 
     #[test]

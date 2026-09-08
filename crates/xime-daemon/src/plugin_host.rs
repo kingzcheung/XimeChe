@@ -1,8 +1,57 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use std::sync::Arc;
 
-use xime_plugin::{EmojiItem, PluginManager, PluginRecord, PluginRuntime};
+use tracing::{debug, info, warn};
+use xime_clipboard::store::ClipboardStore;
+use xime_plugin::{
+    ClipboardEntryInfo, ClipboardReadApi, EmojiItem, HostApis, PluginManager, PluginRecord,
+    PluginRuntime, QuickSendItemInfo, QuickSendReadApi,
+};
+
+/// 剪贴板只读 API 适配器（capability: clipboard_read）。
+struct ClipboardReadAdapter(Arc<ClipboardStore>);
+
+impl ClipboardReadApi for ClipboardReadAdapter {
+    fn recent(&self, limit: usize) -> Vec<ClipboardEntryInfo> {
+        self.0
+            .list_clipboard(limit as i64)
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .map(|e| ClipboardEntryInfo {
+                text: e.text,
+                timestamp: e.timestamp,
+                is_pinned: e.is_pinned,
+            })
+            .collect()
+    }
+}
+
+/// 快捷发送只读 API 适配器（capability: quick_send_read）。
+struct QuickSendReadAdapter(Arc<ClipboardStore>);
+
+impl QuickSendReadApi for QuickSendReadAdapter {
+    fn list(&self) -> Vec<QuickSendItemInfo> {
+        self.0
+            .list_quick_send()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| QuickSendItemInfo {
+                text: e.text,
+                code: e.code,
+            })
+            .collect()
+    }
+}
+
+/// 按存储构建宿主 API 集合（供 PluginRuntime 能力门禁注入）。
+pub fn host_apis(store: &Arc<ClipboardStore>) -> HostApis {
+    HostApis {
+        clipboard: Some(Arc::new(ClipboardReadAdapter(store.clone()))),
+        quick_send: Some(Arc::new(QuickSendReadAdapter(store.clone()))),
+    }
+}
 
 /// 插件宿主：加载已启用插件并提供契约查询。
 ///
@@ -11,12 +60,15 @@ use xime_plugin::{EmojiItem, PluginManager, PluginRecord, PluginRuntime};
 pub struct PluginHost {
     /// 已加载的插件运行时（key = 插件 id）。
     runtimes: HashMap<String, PluginRuntime>,
+    /// 剪贴板存储（宿主只读 API 数据源）。
+    clipboard: Arc<ClipboardStore>,
 }
 
 impl PluginHost {
-    pub fn new() -> Self {
+    pub fn new(clipboard: Arc<ClipboardStore>) -> Self {
         let mut host = Self {
             runtimes: HashMap::new(),
+            clipboard,
         };
         host.load_enabled_plugins();
         host
@@ -72,8 +124,14 @@ impl PluginHost {
             .map_err(|e| format!("manifest: {e}"))?;
         let dir = manager.plugin_dir(&record.id);
         let config_file = manager.config_path(&record.id);
-        PluginRuntime::load(&dir, &manifest.entry, &config_file)
-            .map_err(|e| format!("runtime: {e}"))
+        PluginRuntime::load_with_apis(
+            &dir,
+            &manifest,
+            &config_file,
+            xime_plugin::NetworkPolicy::from_manifest(&manifest.network),
+            host_apis(&self.clipboard),
+        )
+        .map_err(|e| format!("runtime: {e}"))
     }
 
     /// 已加载的 emoji 类插件数量。
@@ -82,6 +140,22 @@ impl PluginHost {
             .values()
             .filter(|r| !r.get_categories().is_empty())
             .count()
+    }
+
+    /// 广播 `text_committed` 下行事件（对齐 Android PluginEventDispatcher）。
+    ///
+    /// 仅 manifest `capabilities.events` 声明了该事件且实现了 `onPluginEvent`
+    /// 的插件会被调用；同步调用，插件网络请求受 host.http 20s 超时约束。
+    pub fn emit_text_committed(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let payload = serde_json::json!({ "text": text });
+        for (id, runtime) in &self.runtimes {
+            if runtime.deliver_event("text_committed", &payload) {
+                debug!("text_committed delivered to '{id}'");
+            }
+        }
     }
 
     /// 从所有已加载 emoji 插件汇总表情候选。
@@ -103,7 +177,7 @@ impl PluginHost {
 
 impl Default for PluginHost {
     fn default() -> Self {
-        Self::new()
+        panic!("PluginHost::default 需要 ClipboardStore，请使用 PluginHost::new(store)")
     }
 }
 
@@ -133,12 +207,28 @@ mod tests {
 
     #[test]
     fn test_plugin_host_empty() {
-        // 直接构造空 host（避免读取用户真实插件目录）
+        // 直接构造空 host（避免读取用户真实插件目录）；store 用内存库
+        let store = Arc::new(ClipboardStore::open(":memory:").expect("in-memory store"));
         let host = PluginHost {
             runtimes: HashMap::new(),
+            clipboard: store,
         };
         assert_eq!(host.emoji_plugin_count(), 0);
         assert!(host.query_emojis("", 10).is_empty());
+    }
+
+    #[test]
+    fn test_host_apis_adapters() {
+        let store = Arc::new(ClipboardStore::open(":memory:").unwrap());
+        store.upsert_and_trim("abc", 1).unwrap();
+        store.insert_quick_send("地址", "dz", 2).unwrap();
+        let apis = host_apis(&store);
+        let clip = apis.clipboard.as_ref().unwrap().recent(5);
+        assert_eq!(clip.len(), 1);
+        assert_eq!(clip[0].text, "abc");
+        let qs = apis.quick_send.as_ref().unwrap().list();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].code, "dz");
     }
 
     /// 安装一个最小 emoji 插件到临时目录，验证加载与查询。
@@ -174,8 +264,10 @@ mod tests {
         manager.install_from_zip(&xipk, false).unwrap();
 
         // 临时目录注入 HOME 不可行，直接构造 host 并手动加载
+        let store = Arc::new(ClipboardStore::open(":memory:").unwrap());
         let mut host = PluginHost {
             runtimes: HashMap::new(),
+            clipboard: store,
         };
         let records = manager.list();
         assert_eq!(records.len(), 1);

@@ -14,6 +14,7 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tracing::{debug, error, warn};
 use wayland_client::backend::ObjectId;
@@ -47,6 +48,8 @@ const MIME_UTF8: &str = "text/plain;charset=utf-8";
 const MIME_PLAIN: &str = "text/plain";
 /// 单次剪贴板读取上限（1 MiB），防止异常大内容长时间阻塞。
 const MAX_READ_BYTES: u64 = 1024 * 1024;
+/// 单次剪贴板读取超时：源应用不响应时放弃本次捕获，避免挂死监听线程。
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 捕获回调（同步桥等消费方）。
 pub type CapturedCallback = Box<dyn Fn(&str) + Send + Sync>;
@@ -176,10 +179,14 @@ fn pick_text_mime(mimes: &[String]) -> Option<&str> {
 }
 
 /// 读取 offer 中的文本（socketpair 代替管道，读写两端线程内直接收发）。
-fn read_offer_text(receive: impl FnOnce(&UnixStream)) -> Option<String> {
+/// `receive_and_flush` 负责入队 receive 请求并 flush 连接：receive 只是
+/// 入队本地缓冲，必须先 flush 到 compositor，源应用才会向 fd 写数据。
+fn read_offer_text(receive_and_flush: impl FnOnce(&UnixStream)) -> Option<String> {
     let (rx, tx) = UnixStream::pair().ok()?;
-    receive(&tx);
+    receive_and_flush(&tx);
     drop(tx); // 关闭写端，读端在数据读完（EOF）后返回
+              // 源应用可能迟迟不写数据（或 offer 已失效），读超时防止挂死监听线程。
+    rx.set_read_timeout(Some(READ_TIMEOUT)).ok()?;
     let mut buf = String::new();
     // 限制读取量，避免异常大内容长时间占用监听线程
     let mut limited = rx.take(MAX_READ_BYTES);
@@ -215,8 +222,13 @@ fn capture_selection(
         return;
     };
     let connection = state.connection.clone();
-    let text = read_offer_text(|fd| receive_with_mime(mime, fd));
-    let _ = connection.flush();
+    // 关键顺序：先入队 receive 并 flush，再阻塞读。若在 flush 前开始读，
+    // compositor 收不到 receive 请求，源应用永不写数据 → 监听线程死锁
+    // （此前表现为：复制成功但剪贴板历史始终为空）。
+    let text = read_offer_text(|fd| {
+        receive_with_mime(mime, fd);
+        let _ = connection.flush();
+    });
     if let Some(text) = text {
         capture(state, text);
     }

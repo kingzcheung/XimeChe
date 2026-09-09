@@ -1,15 +1,53 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**插件系统应用扩展完成（参照 Android 版 Xime 的插件应用模式）**（2026-09-05）
+**三个稳定性 bug 修复完成（开机不自启 / 复制即崩溃 / 剪贴板监听死锁），待重新登录验证开机路径**（2026-09-09）
 
-- 四个功能点：network.hosts 白名单强制、clipboard_sync 同步桥、
-  host.clipboard/quickSend 只读 API、text_committed 事件、快捷发送编码注入
-- libximecore 本地 patch（.cargo/config.toml）改了 xime-plugin crate，随 XimeChe 一起提交
-- 待实机验证：安装真实 webdav-clipboard-sync 插件跑通同步；快捷发送条目需先有 code
-  （面板 ＋ 按钮添加的条目 code 为空，编码管理 UI 待 xime-setup）
+## 诊断与修复（2026-09-09）：开机不自启 + 复制后输入法异常
+
+用户报告两个长期 bug，逐个实锤修复（均有真机证据）：
+
+1. **开机不自启**（fix 6b8bb58）
+   - 根因：KWin 在开机时先于 Plasma 托盘拉起输入法，`TrayManager::register()`
+     里 `RegisterStatusNotifierItem` 因 `org.kde.StatusNotifierWatcher` 尚未
+     上总线而 ServiceUnknown，`?` 传播使 daemon exit(1)。journal 实锤：
+     开机 20:10:22 daemon 退出，20:12:23 KWin 二次拉起才成功——中间 2 分钟
+     输入法不可用
+   - 修复：注册失败改警告 + 后台指数退避重试（1s 起步、封顶 15s），
+     托盘服务就绪后自动补注册，daemon 不再退出
+2. **复制内容 → 输入法"死掉"**（fix 529308f）
+   - 根因：clipboard watcher 的 Dispatch 对创建子对象的 `data_offer` 事件
+     未实现 `event_created_child`，wayland-client 派发时 panic，且 panic
+     位于不可展开调用栈直接 abort 进程。journal 实锤：systemd-coredump
+     xime-daemon + "Missing event_created_child specialization for event
+     opcode 0 of zwlr_data_control_device_v1"。ext/zwlr 两后端均已补特化
+3. **剪贴板历史始终为空**（fix 4bf960e，调试 2 时顺带发现）
+   - 根因：watcher 捕获时 `receive()` 只入队本地缓冲，原代码在阻塞
+     `read_to_string` 之后才 `connection.flush()`——compositor 收不到
+     receive 请求，源应用永不写 fd，监听线程首次 selection 事件即永久
+     挂死（数据库 0 条记录佐证）
+   - 修复：flush 提前到阻塞读之前 + 5s 读超时兜底；真机验证 daemon
+     启动 24ms 内捕获当前剪贴板并入库
+4. **"复制后需切换窗口才能输入中文"= QQ 客户端 bug，非 Xime 问题**（实锤）
+   - DEBUG 日志时序证据：用户在 QQ 复制→点回输入框后，KWin 长时间
+     （1.5~3.3s，多次）不发 ACTIVATE（期间按键直达应用、无 IM 参与）；
+     每一次 ACTIVATE 到达后 daemon 均毫秒级响应处理按键。即 KWin 侧
+     就没激活，daemon 侧状态机（失焦清理/重激活）无缺陷
+   - 与 2026-08-28 诊断一致：QQ 3.2.29 内置 Chromium 138.0.7204.35 的
+     text-input-v3 bug（disable 后不重新 enable，Chromium 139 修复，
+     KWin bug 493098）。规避：QQ 内 alt-tab 切走再切回；根治等 QQ 升级
+5. **日志系统**：`rolling::never` + 默认 DEBUG 使 `~/.config/xime/xime.log`
+   膨胀至 772MB（cosmic_text 渲染日志刷屏）。改为按天轮转
+   （xime.log.YYYY-MM-DD）+ 默认 INFO（RUST_LOG 可覆盖），旧文件已清理
+6. **运维备忘**：手动 kill launcher/daemon 会被 KWin 记为 "Input Method
+   crashed"（QProcess::CrashExit），多次后触发崩溃保护不再自动拉起，
+   reconfigure/forceActivate 均无效，需注销重登。调试输入法进程时用
+   DBus 退出路径（托盘 Exit → Shutdown）而非 kill
 
 ## 本次变更（2026-09-05）③：插件系统应用扩展（参照 Android 版）
+
+遗留待验证：安装真实 webdav-clipboard-sync 插件跑通同步；快捷发送条目需先有 code
+（面板 ＋ 按钮添加的条目 code 为空，编码管理 UI 待 xime-setup）。
 1. **network.hosts 白名单强制**（libximecore xime-plugin，fail-closed）
    - 未声明网络能力 → host.http.request 全部拒绝；声明 hosts → 仅白名单域名
      （归一化比较：去 scheme/路径/端口、忽略大小写）；allowCustomHosts: true → 放行

@@ -249,7 +249,7 @@ impl WaylandLoop {
         let mut conn: Option<Box<dyn ImBackend>> = None;
         let mut xkb: Option<XkbContext> = None;
         let mut rime = RimeEngine::new();
-        let mut plugin_host = PluginHost::new(self.clipboard.clone());
+        let mut plugin_host = PluginHost::new();
         let mut xime_config = XimeConfig::load();
         let _last_key_root_binding = xime_config.get_last_key_root_binding();
         let primary_color = xime_config.get_primary_color();

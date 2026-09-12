@@ -163,13 +163,7 @@ impl SyncState {
         self.runtimes.clear();
         let mut loaded = 0;
         for d in &descriptors {
-            match PluginRuntime::load_with_apis(
-                &d.plugin_dir,
-                &d.manifest,
-                &d.config_file,
-                xime_plugin::NetworkPolicy::from_manifest(&d.manifest.network),
-                crate::plugin_host::host_apis(&self.store),
-            ) {
+            match PluginRuntime::load(&d.plugin_dir, &d.manifest.entry, &d.config_file) {
                 Ok(runtime) => {
                     runtime.call_on_load();
                     self.runtimes.insert(d.id.clone(), runtime);
@@ -252,7 +246,7 @@ return plugin
     fn load_fake_plugin(state: &mut SyncState, dir: &std::path::Path) {
         std::fs::write(dir.join("main.lua"), FAKE_SYNC_LUA).unwrap();
         let manifest = test_manifest();
-        let runtime = PluginRuntime::load(dir, &manifest, &dir.join("config.yaml")).unwrap();
+        let runtime = PluginRuntime::load(dir, &manifest.entry, &dir.join("config.yaml")).unwrap();
         runtime.call_on_load();
         state.runtimes.insert(manifest.id.clone(), runtime);
     }

@@ -376,8 +376,10 @@ impl WaylandLoop {
                     debug!("SelectSchema result: {}", ok);
                 }
                 Ok(DaemonCommand::Shutdown) => {
-                    debug!("Shutdown requested");
-                    break;
+                    debug!("Shutdown requested, exiting process with status 0");
+                    // 必须整进程退出：DBus 主循环不感知该命令；exit(0) 为正常
+                    // 退出，KWin 不会计入 QProcess::CrashExit 崩溃保护。
+                    std::process::exit(0);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {

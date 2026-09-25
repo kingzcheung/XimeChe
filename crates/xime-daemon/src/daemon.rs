@@ -79,4 +79,14 @@ impl XimeDaemon {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
     }
+
+    /// 优雅退出：进程以状态码 0 结束（kill -15 会被 KWin 记为
+    /// QProcess::CrashExit，多次后触发其崩溃保护拒绝重启输入法）。
+    async fn shutdown(&self) -> zbus::fdo::Result<()> {
+        debug!("Received Shutdown request");
+        self.command_tx
+            .send(DaemonCommand::Shutdown)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
 }

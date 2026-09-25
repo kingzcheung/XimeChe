@@ -13,6 +13,7 @@ const SNI_OBJECT: &str = "/StatusNotifierItem";
 const MENU_OBJECT: &str = "/MenuBar";
 
 pub struct TrayManager {
+    connection: Connection,
     sni_ref: InterfaceRef<StatusNotifierItem>,
 }
 
@@ -49,7 +50,14 @@ impl TrayManager {
         } else {
             debug!("SNI registered successfully (initially hidden)");
         }
-        Ok((Self { sni_ref }, toggle_rx, action_rx))
+        Ok((
+            Self {
+                connection: connection.clone(),
+                sni_ref,
+            },
+            toggle_rx,
+            action_rx,
+        ))
     }
 
     async fn register_with_watcher(connection: &Connection) -> zbus::Result<()> {
@@ -83,6 +91,26 @@ impl TrayManager {
                 }
             }
         });
+    }
+
+    /// 请求 KWin 强制激活输入法（org.kde.kwin.VirtualKeyboard.forceActivate）。
+    ///
+    /// IM 未被 KWin 激活时键盘事件不经过 IM，托盘点击是唯一控制通道；
+    /// 用户点击托盘切换模式时顺带调用，让切换在"卡死"状态下也能生效。
+    pub async fn force_activate_im(&self) {
+        if let Err(e) = self
+            .connection
+            .call_method(
+                Some("org.kde.KWin"),
+                "/VirtualKeyboard",
+                Some("org.kde.kwin.VirtualKeyboard"),
+                "forceActivate",
+                &(),
+            )
+            .await
+        {
+            debug!("forceActivate failed: {}", e);
+        }
     }
 
     pub async fn set_mode(&self, mode: InputMode) {

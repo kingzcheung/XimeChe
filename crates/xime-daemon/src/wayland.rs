@@ -337,6 +337,15 @@ impl WaylandLoop {
                             self.tray.set_mode(tray_mode).await;
                         });
                         debug!("Tray updated after toggle: ascii_mode={}", new_ascii);
+
+                        // IM 未激活时（如旧 Chromium 应用复制后不重新 enable
+                        // text-input），键盘事件完全不经过 IM，Shift/Ctrl+Space
+                        // 都无效；托盘点击是唯一可达的控制通道，借 KWin 的
+                        // forceActivate 强制激活，让本次切换真正生效。
+                        if !last_active {
+                            debug!("IM inactive on toggle, requesting KWin forceActivate");
+                            self.rt_handle.block_on(self.tray.force_activate_im());
+                        }
                     }
                 }
                 Ok(DaemonCommand::Deploy) => {
@@ -407,9 +416,14 @@ impl WaylandLoop {
 
                 if is_active != last_active {
                     debug!("State changed: active={}", is_active);
-                    self.rt_handle.block_on(async {
-                        self.tray.set_visible(is_active).await;
-                    });
+                    // 托盘常驻：失活时不再隐藏图标（fcitx5 风格）。图标是 IM
+                    // 未激活时唯一可达的控制入口（键盘事件不经过 IM），藏掉
+                    // 会让用户在"卡死"时失去恢复手段。
+                    if is_active {
+                        self.rt_handle.block_on(async {
+                            self.tray.set_visible(true).await;
+                        });
+                    }
                     last_active = is_active;
 
                     if !is_active {

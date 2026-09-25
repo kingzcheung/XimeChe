@@ -139,6 +139,10 @@ fn main() -> anyhow::Result<()> {
 
         info!("DBus service registered at org.xime.Xime");
         info!("Tray registered (background retry if watcher was not up yet)");
+
+        // 托盘常驻显示（fcitx5 风格）：图标是 IM 未激活时唯一的控制入口，
+        // 隐藏会让用户在输入法"卡死"（KWin 未激活）时失去恢复手段。
+        tray.set_visible(true).await;
         info!("Waiting for Wayland connection from launcher...");
 
         loop {

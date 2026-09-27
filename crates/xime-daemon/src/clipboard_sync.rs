@@ -1,10 +1,10 @@
-//! 剪贴板同步桥：本地剪贴板（`xime-clipboard`）↔ `clipboard_sync` Lua 插件。
+//! 剪贴板同步桥：本地剪贴板（`xime-clipboard`）↔ `clipboard_sync` JS 插件。
 //!
 //! 对齐 Android 版 `ClipboardSyncBridge` 的语义：
-//! - **push**：watcher 捕获文本 → hash 去重 → `push(profile)` 给所有已启用插件；
+//! - **push**：watcher 捕获文本 → hash 去重 → `clipboardSync.push(profile)` 给所有已启用插件；
 //! - **pull**：daemon 启动与打开剪贴板面板时各拉取一次 → 回声抑制（跳过自己刚
 //!   推送的内容）→ 其余经 `upsert_and_trim` 入库（存储层按文本去重/置顶/裁剪）；
-//! - **独立线程**：Lua 插件的网络请求（host.http，20s 超时）不阻塞按键处理。
+//! - **独立线程**：JS 插件的网络请求（host.http.request，默认 20s 超时）不阻塞按键处理。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use xime_plugin::{PluginManager, PluginManifest, PluginRuntime};
 
 use xime_clipboard::store::ClipboardStore;
 
-/// 同步插件加载描述（运行时在桥线程内创建，规避 Lua state 跨线程约束）。
+/// 同步插件加载描述（运行时在桥线程内创建，规避 QuickJS Context 跨线程约束）。
 #[derive(Debug, Clone)]
 pub struct SyncPluginDescriptor {
     pub id: String,
@@ -207,27 +207,34 @@ mod tests {
     use super::*;
 
     /// 远端模拟插件：push 写入 host.config，pull 读回（沙箱无 io，用 host.config 充当远端）。
-    const FAKE_SYNC_LUA: &str = r#"
-local plugin = {}
-function plugin.push(profile)
-  local list = host.json.decode(host.config.get("remote") or "[]")
-  table.insert(list, profile)
-  host.config.set("remote", host.json.encode(list))
-  return true
-end
-function plugin.pull()
-  return host.json.decode(host.config.get("remote") or "[]")
-end
-function plugin.testConnection() return nil end
-function plugin.remoteCount()
-  return #host.json.decode(host.config.get("remote") or "[]")
-end
-return plugin
+    const FAKE_SYNC_JS: &str = r#"(function () {
+  globalThis.plugin = {
+    clipboardSync: {
+      push: function (profile) {
+        var list = host.config.getJson("remote") || [];
+        list.push(profile);
+        host.config.set("remote", JSON.stringify(list));
+        return true;
+      },
+      pull: function () {
+        var raw = host.config.get("remote");
+        if (raw == null) return null;
+        var list = JSON.parse(raw);
+        return list.length ? list[list.length - 1] : null;
+      },
+      test: function () { return null; },
+      remoteCount: function () {
+        var list = host.config.getJson("remote") || [];
+        return list.length;
+      },
+    },
+  };
+})();
 "#;
 
     fn test_manifest() -> PluginManifest {
         PluginManifest::parse(
-            "id: com.test.sync\nname: Test Sync\nversion: 1.0.0\ntype: clipboard_sync\nentry: main.lua\n",
+            "id: com.test.sync\nname: Test Sync\nversion: 1.0.0\ntype: clipboard_sync\nentry: main.js\n",
         )
         .unwrap()
     }
@@ -244,7 +251,7 @@ return plugin
     }
 
     fn load_fake_plugin(state: &mut SyncState, dir: &std::path::Path) {
-        std::fs::write(dir.join("main.lua"), FAKE_SYNC_LUA).unwrap();
+        std::fs::write(dir.join("main.js"), FAKE_SYNC_JS).unwrap();
         let manifest = test_manifest();
         let runtime = PluginRuntime::load(dir, &manifest.entry, &dir.join("config.yaml")).unwrap();
         runtime.call_on_load();
@@ -257,8 +264,9 @@ return plugin
             .runtimes
             .values()
             .next()
-            .and_then(|r| r.call_fn::<i64>("remoteCount", ()))
-            .unwrap_or(-1) as usize
+            .and_then(|r| r.call_plugin_fn("clipboardSync.remoteCount", &[]))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(u32::MAX)) as usize
     }
 
     #[test]
@@ -336,7 +344,7 @@ return plugin
             plugin_dir: dir.path().to_path_buf(),
             config_file: dir.path().join("config.yaml"),
         };
-        std::fs::write(dir.path().join("main.lua"), FAKE_SYNC_LUA).unwrap();
+        std::fs::write(dir.path().join("main.js"), FAKE_SYNC_JS).unwrap();
         state.handle_reload(vec![d.clone()]);
         state.handle_captured("x");
         assert_eq!(remote_count(&state), 1);

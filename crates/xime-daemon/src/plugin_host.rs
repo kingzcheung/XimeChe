@@ -86,8 +86,8 @@ impl PluginHost {
 
     /// 广播 `text_committed` 下行事件（契约同 Android PluginEventDispatcher）。
     ///
-    /// 向所有已加载插件 fire-and-forget 调用 `onPluginEvent(eventType, data)`；
-    /// 未实现该函数的插件由 runtime 侧跳过。
+    /// 向所有已加载插件 fire-and-forget 调用 `plugin.events.onTextCommitted(payload)`；
+    /// 未实现该事件槽的插件由 runtime 侧跳过。
     pub fn emit_text_committed(&self, text: &str) {
         if text.is_empty() {
             return;
@@ -165,22 +165,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        // 构造 .xipk 并安装
+        // 构造 .xipk 并安装（manifest.yaml 兼容路径 + JS 入口，验证存量包格式可装可跑）
         let xipk = root.join("test.xipk");
         let file = std::fs::File::create(&xipk).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         zip.start_file("manifest.yaml", zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(
-            "id: com.example.kaomoji\nname: Test Emoji\nversion: 1.0.0\ntype: emoji\nentry: main.lua\n"
+            "id: com.example.kaomoji\nname: Test Emoji\nversion: 1.0.0\ntype: emoji\nentry: main.js\n"
                 .as_bytes(),
         )
         .unwrap();
-        zip.start_file("main.lua", zip::write::SimpleFileOptions::default())
+        zip.start_file("main.js", zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(
-            "local plugin = {}\nfunction plugin.getCategories() return { \"颜文字\" } end\nfunction plugin.getEmojis(category, searchText, topK)\n  local list = { { id=\"k1\", text=\"(ﾟ∀ﾟ)\", category=\"颜文字\" }, { id=\"k2\", text=\"(^u^)\", category=\"颜文字\" } }\n  local out = {}\n  for i, e in ipairs(list) do\n    if searchText == \"\" or string.find(e.text, searchText, 1, true) then table.insert(out, e) end\n    if #out >= topK then break end\n  end\n  return out\nend\nfunction plugin.getCategoryLayoutConfig(category) return { columns = 3 } end\nreturn plugin\n"
-                .as_bytes(),
+            r#"(function () {
+  var kaomojis = ["(ﾟ∀ﾟ)", "(^u^)"];
+  globalThis.plugin = {
+    emoji: {
+      listCategories: function () { return ["颜文字"]; },
+      query: function (q) {
+        var list = [];
+        for (var i = 0; i < kaomojis.length; i++) {
+          if (!q.keyword || kaomojis[i].indexOf(q.keyword) !== -1) {
+            list.push({ id: "k" + (i + 1), text: kaomojis[i] });
+          }
+          if (list.length >= q.topK) break;
+        }
+        return list;
+      },
+    },
+  };
+})();
+"#
+            .as_bytes(),
         )
         .unwrap();
         zip.finish().unwrap();

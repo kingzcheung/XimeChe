@@ -86,7 +86,7 @@ sudo apt install librime-dev libxkbcommon-dev
 ### 从 Debian 包安装
 
 ```bash
-sudo dpkg -i xime_0.1.2-1_amd64.deb
+sudo dpkg -i xime_0.1.3-1_amd64.deb
 ```
 
 安装后重新登录 KDE Plasma。
@@ -142,7 +142,7 @@ cargo install cargo-deb
 cargo deb -p xime
 ```
 
-生成的 deb 包位于 `target/debian/xime_0.1.2-1_amd64.deb`。
+生成的 deb 包位于 `target/debian/xime_0.1.3-1_amd64.deb`。
 
 ## 运行
 

@@ -1,10 +1,14 @@
-//! 剪贴板同步桥：本地剪贴板（`xime-clipboard`）↔ `clipboard_sync` Lua 插件。
+//! 剪贴板同步桥：本地剪贴板（`xime-clipboard`）↔ `clipboard_sync` JS 插件。
 //!
 //! 对齐 Android 版 `ClipboardSyncBridge` 的语义：
-//! - **push**：watcher 捕获文本 → hash 去重 → `push(profile)` 给所有已启用插件；
+//! - **单插件生效**：实际加载哪个插件由 `clipboard_sync.toml`（设置程序
+//!   「剪贴板同步」页下拉写入）决定——`enabled` 总开关 + `plugin_id` 偏好，
+//!   解析语义对齐 Android `ActivePluginSelection.resolve`（偏好有效用偏好，
+//!   否则取首个已启用项）；
+//! - **push**：watcher 捕获文本 → hash 去重 → `clipboardSync.push(profile)`；
 //! - **pull**：daemon 启动与打开剪贴板面板时各拉取一次 → 回声抑制（跳过自己刚
 //!   推送的内容）→ 其余经 `upsert_and_trim` 入库（存储层按文本去重/置顶/裁剪）；
-//! - **独立线程**：Lua 插件的网络请求（host.http，20s 超时）不阻塞按键处理。
+//! - **独立线程**：JS 插件的网络请求（host.http.request，默认 20s 超时）不阻塞按键处理。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +22,7 @@ use xime_plugin::{PluginManager, PluginManifest, PluginRuntime};
 
 use xime_clipboard::store::ClipboardStore;
 
-/// 同步插件加载描述（运行时在桥线程内创建，规避 Lua state 跨线程约束）。
+/// 同步插件加载描述（运行时在桥线程内创建，规避 QuickJS Context 跨线程约束）。
 #[derive(Debug, Clone)]
 pub struct SyncPluginDescriptor {
     pub id: String,
@@ -54,11 +58,52 @@ fn profile_json(text: &str, hash: &str) -> serde_json::Value {
     })
 }
 
-/// 扫描已启用的 clipboard_sync 插件（daemon 启动 / ReloadPlugins 时调用）。
+/// 剪贴板同步选择（`clipboard_sync.toml`，与设置程序 xime-setup 共享同一文件）。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SyncSelection {
+    /// 总开关：false 时同步桥不加载任何插件。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 选中的同步插件 id（空或失效时回落到首个已启用的 clipboard_sync 插件）。
+    #[serde(default)]
+    pub plugin_id: String,
+}
+
+/// `clipboard_sync.toml` 路径（`~/.config/<app>/clipboard_sync.toml`）。
+pub fn sync_config_path() -> PathBuf {
+    crate::plugin_host::plugins_dir()
+        .parent()
+        .expect("plugins dir has parent")
+        .join("clipboard_sync.toml")
+}
+
+pub fn read_sync_selection() -> SyncSelection {
+    read_sync_selection_from(&sync_config_path())
+}
+
+fn read_sync_selection_from(path: &std::path::Path) -> SyncSelection {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| toml::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+/// 扫描实际生效的同步插件（daemon 启动 / ReloadPlugins 时调用）。
 pub fn scan_descriptors() -> Vec<SyncPluginDescriptor> {
-    let root = crate::plugin_host::plugins_dir();
-    let manager = PluginManager::new(&root);
-    manager
+    resolve_descriptors(&crate::plugin_host::plugins_dir(), &read_sync_selection())
+}
+
+/// 按 `SyncSelection` 解析要加载的插件：偏好插件有效则只用它，否则回落首个
+/// 已启用的 clipboard_sync 插件；总开关关闭或无候选返回空。
+pub fn resolve_descriptors(
+    root: &std::path::Path,
+    sel: &SyncSelection,
+) -> Vec<SyncPluginDescriptor> {
+    if !sel.enabled {
+        return Vec::new();
+    }
+    let manager = PluginManager::new(root);
+    let mut candidates: Vec<SyncPluginDescriptor> = manager
         .list()
         .into_iter()
         .filter(|r| r.enabled)
@@ -78,7 +123,13 @@ pub fn scan_descriptors() -> Vec<SyncPluginDescriptor> {
                 manifest,
             })
         })
-        .collect()
+        .collect();
+    if let Some(pos) = candidates.iter().position(|d| d.id == sel.plugin_id) {
+        let preferred = candidates.swap_remove(pos);
+        return vec![preferred];
+    }
+    candidates.truncate(1);
+    candidates
 }
 
 /// 桥线程状态。
@@ -207,27 +258,34 @@ mod tests {
     use super::*;
 
     /// 远端模拟插件：push 写入 host.config，pull 读回（沙箱无 io，用 host.config 充当远端）。
-    const FAKE_SYNC_LUA: &str = r#"
-local plugin = {}
-function plugin.push(profile)
-  local list = host.json.decode(host.config.get("remote") or "[]")
-  table.insert(list, profile)
-  host.config.set("remote", host.json.encode(list))
-  return true
-end
-function plugin.pull()
-  return host.json.decode(host.config.get("remote") or "[]")
-end
-function plugin.testConnection() return nil end
-function plugin.remoteCount()
-  return #host.json.decode(host.config.get("remote") or "[]")
-end
-return plugin
+    const FAKE_SYNC_JS: &str = r#"(function () {
+  globalThis.plugin = {
+    clipboardSync: {
+      push: function (profile) {
+        var list = host.config.getJson("remote") || [];
+        list.push(profile);
+        host.config.set("remote", JSON.stringify(list));
+        return true;
+      },
+      pull: function () {
+        var raw = host.config.get("remote");
+        if (raw == null) return null;
+        var list = JSON.parse(raw);
+        return list.length ? list[list.length - 1] : null;
+      },
+      test: function () { return null; },
+      remoteCount: function () {
+        var list = host.config.getJson("remote") || [];
+        return list.length;
+      },
+    },
+  };
+})();
 "#;
 
     fn test_manifest() -> PluginManifest {
         PluginManifest::parse(
-            "id: com.test.sync\nname: Test Sync\nversion: 1.0.0\ntype: clipboard_sync\nentry: main.lua\n",
+            "id: com.test.sync\nname: Test Sync\nversion: 1.0.0\ntype: clipboard_sync\nentry: main.js\n",
         )
         .unwrap()
     }
@@ -244,7 +302,7 @@ return plugin
     }
 
     fn load_fake_plugin(state: &mut SyncState, dir: &std::path::Path) {
-        std::fs::write(dir.join("main.lua"), FAKE_SYNC_LUA).unwrap();
+        std::fs::write(dir.join("main.js"), FAKE_SYNC_JS).unwrap();
         let manifest = test_manifest();
         let runtime = PluginRuntime::load(dir, &manifest.entry, &dir.join("config.yaml")).unwrap();
         runtime.call_on_load();
@@ -257,8 +315,9 @@ return plugin
             .runtimes
             .values()
             .next()
-            .and_then(|r| r.call_fn::<i64>("remoteCount", ()))
-            .unwrap_or(-1) as usize
+            .and_then(|r| r.call_plugin_fn("clipboardSync.remoteCount", &[]))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(u32::MAX)) as usize
     }
 
     #[test]
@@ -336,7 +395,7 @@ return plugin
             plugin_dir: dir.path().to_path_buf(),
             config_file: dir.path().join("config.yaml"),
         };
-        std::fs::write(dir.path().join("main.lua"), FAKE_SYNC_LUA).unwrap();
+        std::fs::write(dir.path().join("main.js"), FAKE_SYNC_JS).unwrap();
         state.handle_reload(vec![d.clone()]);
         state.handle_captured("x");
         assert_eq!(remote_count(&state), 1);
@@ -347,5 +406,127 @@ return plugin
         state.handle_reload(vec![d]);
         state.handle_captured("y");
         assert_eq!(remote_count(&state), 2);
+    }
+
+    // ---- SyncSelection / resolve_descriptors ----
+
+    /// 造一个插件目录（manifest.yaml，无需 main.js：resolve 不加载运行时）。
+    fn write_plugin_dir(root: &std::path::Path, id: &str, name: &str, ptype: &str) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.yaml"),
+            format!("id: {id}\nname: {name}\nversion: 1.0.0\ntype: {ptype}\nentry: main.js\n"),
+        )
+        .unwrap();
+    }
+
+    /// 造 registry.yaml（id, enabled）条目。
+    fn write_registry(root: &std::path::Path, entries: &[(&str, bool)]) {
+        let mut yaml = String::from("plugins:\n");
+        for (id, enabled) in entries {
+            yaml.push_str(&format!(
+                "  - id: {id}\n    name: {id}\n    version: 1.0.0\n    type: clipboard_sync\n    enabled: {enabled}\n"
+            ));
+        }
+        std::fs::write(root.join("registry.yaml"), yaml).unwrap();
+    }
+
+    fn ids(descriptors: &[SyncPluginDescriptor]) -> Vec<String> {
+        descriptors.iter().map(|d| d.id.clone()).collect()
+    }
+
+    #[test]
+    fn test_resolve_switch_off_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(dir.path(), "com.a.sync", "A", "clipboard_sync");
+        write_registry(dir.path(), &[("com.a.sync", true)]);
+        let sel = SyncSelection {
+            enabled: false,
+            plugin_id: "com.a.sync".into(),
+        };
+        assert!(resolve_descriptors(dir.path(), &sel).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_prefers_plugin_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(dir.path(), "com.a.sync", "A", "clipboard_sync");
+        write_plugin_dir(dir.path(), "com.b.sync", "B", "clipboard_sync");
+        write_registry(dir.path(), &[("com.a.sync", true), ("com.b.sync", true)]);
+        let sel = SyncSelection {
+            enabled: true,
+            plugin_id: "com.b.sync".into(),
+        };
+        assert_eq!(
+            ids(&resolve_descriptors(dir.path(), &sel)),
+            vec!["com.b.sync".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_fallback_first_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(dir.path(), "com.a.sync", "A", "clipboard_sync");
+        write_plugin_dir(dir.path(), "com.b.sync", "B", "clipboard_sync");
+        write_registry(dir.path(), &[("com.a.sync", true), ("com.b.sync", true)]);
+        // 未选择（plugin_id 空）→ 首个已启用项，且单插件语义
+        let sel = SyncSelection {
+            enabled: true,
+            plugin_id: String::new(),
+        };
+        assert_eq!(
+            ids(&resolve_descriptors(dir.path(), &sel)),
+            vec!["com.a.sync".to_string()]
+        );
+        // 偏好失效（未安装）→ 同样回落
+        let sel = SyncSelection {
+            enabled: true,
+            plugin_id: "com.gone.sync".into(),
+        };
+        assert_eq!(
+            ids(&resolve_descriptors(dir.path(), &sel)),
+            vec!["com.a.sync".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_skips_disabled_and_other_types() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(dir.path(), "com.a.sync", "A", "clipboard_sync");
+        write_plugin_dir(dir.path(), "com.b.sync", "B", "clipboard_sync");
+        write_plugin_dir(dir.path(), "com.c.emoji", "C", "emoji");
+        write_registry(
+            dir.path(),
+            &[
+                ("com.a.sync", false),
+                ("com.b.sync", true),
+                ("com.c.emoji", true),
+            ],
+        );
+        let sel = SyncSelection {
+            enabled: true,
+            plugin_id: String::new(),
+        };
+        assert_eq!(
+            ids(&resolve_descriptors(dir.path(), &sel)),
+            vec!["com.b.sync".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_read_sync_selection_parses_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipboard_sync.toml");
+        assert_eq!(read_sync_selection_from(&path), SyncSelection::default());
+
+        std::fs::write(&path, "enabled = true\nplugin_id = \"com.b.sync\"\n").unwrap();
+        assert_eq!(
+            read_sync_selection_from(&path),
+            SyncSelection {
+                enabled: true,
+                plugin_id: "com.b.sync".into(),
+            }
+        );
     }
 }

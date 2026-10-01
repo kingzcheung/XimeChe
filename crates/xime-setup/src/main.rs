@@ -247,9 +247,7 @@ fn main() -> iced::Result {
             .and_then(|json| serde_json::from_str::<SchemaEntriesResult>(&json).ok())
     });
     // rime 用户资料同步（同步与备份页「立即同步」，wayland 线程关会话执行）。
-    set_notify_sync_user_data(|| {
-        user_dict_op_json(op_json("sync", &[])).is_some()
-    });
+    set_notify_sync_user_data(|| user_dict_op_json(op_json("sync", &[])).is_some());
 
     // 注入应用元数据（目录沿用 xime，librime 分发标识为 XimeChe）。
     let _ = xime_setup_lib::set_app_metadata(xime_setup_lib::AppMetadata {

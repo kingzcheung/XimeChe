@@ -15,6 +15,7 @@ const MENU_OBJECT: &str = "/MenuBar";
 pub struct TrayManager {
     connection: Connection,
     sni_ref: InterfaceRef<StatusNotifierItem>,
+    menu_ref: InterfaceRef<DBusMenu>,
 }
 
 impl TrayManager {
@@ -40,6 +41,10 @@ impl TrayManager {
             .object_server()
             .interface::<_, StatusNotifierItem>(SNI_OBJECT)
             .await?;
+        let menu_ref = connection
+            .object_server()
+            .interface::<_, DBusMenu>(MENU_OBJECT)
+            .await?;
 
         // 开机时 KWin 会先于 Plasma 托盘拉起输入法，此时 StatusNotifierWatcher
         // 还没出现在总线上。注册失败不能让 daemon 退出（否则输入法"开机不自启"），
@@ -54,10 +59,24 @@ impl TrayManager {
             Self {
                 connection: connection.clone(),
                 sni_ref,
+                menu_ref,
             },
             toggle_rx,
             action_rx,
         ))
+    }
+
+    /// 更新托盘菜单的方案切换组；内容变化时发 LayoutUpdated 让托盘重拉布局。
+    pub async fn update_schema_menu(&self, schemas: Vec<(String, String)>, current: String) {
+        let revision = {
+            let menu = self.menu_ref.get().await;
+            menu.set_schemas(schemas, current);
+            menu.revision()
+        };
+        if let Err(e) = DBusMenu::layout_updated(self.menu_ref.signal_emitter(), revision, 0).await
+        {
+            debug!("LayoutUpdated signal failed: {}", e);
+        }
     }
 
     async fn register_with_watcher(connection: &Connection) -> zbus::Result<()> {

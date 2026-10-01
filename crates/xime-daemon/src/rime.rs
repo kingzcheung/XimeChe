@@ -97,6 +97,41 @@ impl RimeEngine {
         }
     }
 
+    /// 可切换方案列表 (id, 显示名)（托盘菜单用）。
+    ///
+    /// id 来自 levers 的 switcher 列表；显示名读 `<id>.schema.yaml` 的
+    /// `name:` 行（解析不到用 id）。levers 不碰会话，失败退化为空列表。
+    pub fn available_schemas(&self) -> Vec<(String, String)> {
+        let Ok(manager) = librime::SwitcherSettings::new() else {
+            return Vec::new();
+        };
+        let Ok(ids) = manager.get_available_schema_list() else {
+            return Vec::new();
+        };
+        let user_dir = get_config_dir();
+        let (shared_dir, _) = get_data_dirs();
+        ids.into_iter()
+            .map(|id| {
+                let name = [user_dir.as_path(), shared_dir.as_path()]
+                    .iter()
+                    .find_map(|dir| {
+                        std::fs::read_to_string(dir.join(format!("{id}.schema.yaml"))).ok()
+                    })
+                    .and_then(|text| {
+                        text.lines()
+                            .filter_map(|line| {
+                                let rest = line.trim().strip_prefix("name:")?;
+                                let v = rest.trim().trim_matches('"').trim_matches('\'');
+                                (!v.is_empty()).then_some(v.to_string())
+                            })
+                            .next()
+                    })
+                    .unwrap_or_else(|| id.clone());
+                (id, name)
+            })
+            .collect()
+    }
+
     pub fn select_schema(&mut self, schema_id: &str) -> bool {
         if let Some(session) = self.session.as_ref() {
             match session.select_schema(schema_id) {

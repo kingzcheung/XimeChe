@@ -316,6 +316,11 @@ impl WaylandLoop {
                     match connect_im_from_fd(fd) {
                         Ok(backend) => {
                             info!("Connected via launcher fd (KWin mode)");
+                            // 托盘菜单注入方案切换组（levers 此时可用了）。
+                            let schemas = rime.available_schemas();
+                            let current = rime.get_current_schema().unwrap_or_default();
+                            self.rt_handle
+                                .block_on(self.tray.update_schema_menu(schemas, current));
                             conn = Some(backend);
                         }
                         Err(e) => {
@@ -383,6 +388,12 @@ impl WaylandLoop {
                     let ok = rime.select_schema(&schema_id);
                     let _ = result_tx.send(ok);
                     debug!("SelectSchema result: {}", ok);
+                    if ok {
+                        // 托盘菜单 ✓ 跟随（列表不变，只换选中项）。
+                        let schemas = rime.available_schemas();
+                        self.rt_handle
+                            .block_on(self.tray.update_schema_menu(schemas, schema_id));
+                    }
                 }
                 Ok(DaemonCommand::ListDictEntries(dict, query, result_tx)) => {
                     debug!("ListDictEntries command received: {dict} query={query:?}");

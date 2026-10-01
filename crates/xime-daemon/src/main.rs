@@ -171,6 +171,14 @@ fn main() -> anyhow::Result<()> {
                         MenuAction::Deploy => {
                             command_tx.send(DaemonCommand::Deploy).ok();
                         }
+                        MenuAction::SelectSchema(schema_id) => {
+                            // 结果接收端即弃：托盘切换不关心结果，
+                            // wayland 侧 send 失败已被 `let _` 忽略。
+                            let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+                            command_tx
+                                .send(DaemonCommand::SelectSchema(schema_id, result_tx))
+                                .ok();
+                        }
                         MenuAction::Exit => {
                             command_tx.send(DaemonCommand::Shutdown).ok();
                             break;

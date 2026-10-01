@@ -169,6 +169,8 @@ pub enum UserDictOp {
     Export { dict: String, path: String },
     /// 从文本合并导入。
     Import { dict: String, path: String },
+    /// rime 用户资料同步（快照导出 + 多端合并，对齐 weasel「用户资料同步」）。
+    Sync,
 }
 
 /// 校验一条用户词条的输入（对齐安卓 `checkEntryInput`）：词/码 trim 后非空、
@@ -245,6 +247,14 @@ impl UserDictOp {
                 let n = librime::import_user_dict(dict, path)
                     .map_err(|e| format!("导入失败：{e:?}"))?;
                 Ok(n as i64)
+            }
+            Self::Sync => {
+                // sync_user_data 会动 userdb（快照导出+合并），同样要求关会话；
+                // join_maintenance_thread 等维护线程收尾（对齐 weasel
+                // Configurator::SyncUserData 与 XimeYao）。
+                librime::sync_user_data().map_err(|e| format!("同步失败：{e:?}"))?;
+                librime::join_maintenance_thread();
+                Ok(1)
             }
         }
     }

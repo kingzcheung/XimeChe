@@ -9,7 +9,7 @@ use xime_setup_lib::{
     set_notify_dict_entry_write, set_notify_dict_export, set_notify_dict_import,
     set_notify_dict_list, set_notify_dict_restore, set_notify_phrase_list, set_notify_phrase_save,
     set_notify_reload_plugins, set_notify_reload_style, set_notify_schema_entries,
-    set_notify_select_schema,
+    set_notify_select_schema, set_notify_sync_user_data,
 };
 
 /// 调 daemon 的无参 DBus 方法并返回 JSON 应答文本。
@@ -245,6 +245,10 @@ fn main() -> iced::Result {
         daemon_call_json2_err("ListSchemaEntries", schema_id, query)
             .ok()
             .and_then(|json| serde_json::from_str::<SchemaEntriesResult>(&json).ok())
+    });
+    // rime 用户资料同步（同步与备份页「立即同步」，wayland 线程关会话执行）。
+    set_notify_sync_user_data(|| {
+        user_dict_op_json(op_json("sync", &[])).is_some()
     });
 
     // 注入应用元数据（目录沿用 xime，librime 分发标识为 XimeChe）。

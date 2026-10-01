@@ -384,6 +384,14 @@ impl WaylandLoop {
                     let _ = result_tx.send(ok);
                     debug!("SelectSchema result: {}", ok);
                 }
+                Ok(DaemonCommand::ListDictEntries(dict, query, result_tx)) => {
+                    debug!("ListDictEntries command received: {dict} query={query:?}");
+                    // 关会话 → 导出（userdb 独占）→ 重建；期间按键会丢 composition，
+                    // 设置页词典浏览与打字互斥（对齐 XimeYao 词典写路径的语义）。
+                    let result = rime
+                        .with_user_dict_closed(|| crate::user_dict::list_entries(&dict, &query));
+                    let _ = result_tx.send(result);
+                }
                 Ok(DaemonCommand::Shutdown) => {
                     debug!("Shutdown requested, exiting process with status 0");
                     // 必须整进程退出：DBus 主循环不感知该命令；exit(0) 为正常

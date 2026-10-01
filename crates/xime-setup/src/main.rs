@@ -1,8 +1,48 @@
 use std::fs::File;
 use std::path::PathBuf;
+use xime_setup_lib::state::{DictEntriesResult, DictListResult};
 use xime_setup_lib::{
-    set_notify_deploy, set_notify_reload_plugins, set_notify_reload_style, set_notify_select_schema,
+    set_notify_deploy, set_notify_dict_entries, set_notify_dict_list, set_notify_reload_plugins,
+    set_notify_reload_style, set_notify_select_schema,
 };
+
+/// 调 daemon 的无参 DBus 方法并返回 JSON 应答文本。
+fn daemon_call_json0(method: &str) -> Option<String> {
+    let conn = zbus::blocking::Connection::session().ok()?;
+    let reply = conn
+        .call_method(
+            Some("org.xime.Xime"),
+            "/org/xime/Xime",
+            Some("org.xime.Xime.Controller"),
+            method,
+            &(),
+        )
+        .ok()?;
+    reply.body().deserialize::<String>().ok()
+}
+
+/// 调 daemon 的双字符串参数 DBus 方法并返回 JSON 应答文本。
+fn daemon_call_json2(method: &str, a: &str, b: &str) -> Option<String> {
+    let conn = zbus::blocking::Connection::session().ok()?;
+    let reply = conn
+        .call_method(
+            Some("org.xime.Xime"),
+            "/org/xime/Xime",
+            Some("org.xime.Xime.Controller"),
+            method,
+            &(a, b),
+        )
+        .ok()?;
+    reply.body().deserialize::<String>().ok()
+}
+
+fn dict_list_from_json(json: &str) -> Option<DictListResult> {
+    serde_json::from_str(json).ok()
+}
+
+fn dict_entries_from_json(json: &str) -> Option<DictEntriesResult> {
+    serde_json::from_str(json).ok()
+}
 
 fn get_lock_file_path() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
@@ -92,6 +132,16 @@ fn main() -> iced::Result {
                 &(),
             );
         }
+    });
+
+    // 词典管理（dict-page）：数据通道 = daemon DBus（levers 导出临时文件在
+    // daemon 进程执行，设置进程只收 JSON）。
+    set_notify_dict_list(|| {
+        daemon_call_json0("ListUserDicts").and_then(|json| dict_list_from_json(&json))
+    });
+    set_notify_dict_entries(|dict, query| {
+        daemon_call_json2("ListDictEntries", dict, query)
+            .and_then(|json| dict_entries_from_json(&json))
     });
 
     // 注入应用元数据（目录沿用 xime，librime 分发标识为 XimeChe）。

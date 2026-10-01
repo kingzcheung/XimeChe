@@ -89,4 +89,41 @@ impl XimeDaemon {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
+
+    /// 列出用户词典（设置程序「词典管理」页；JSON 传输，对齐 XimeYao IPC 语义）。
+    ///
+    /// levers 调用是阻塞的：zbus object server 不在 tokio 上下文，
+    /// spawn_blocking 会 panic 导致方法永不回包，改用 std 线程 + oneshot
+    /// （tokio oneshot 自身不依赖 runtime）。
+    async fn list_user_dicts(&self) -> zbus::fdo::Result<String> {
+        debug!("Received ListUserDicts request");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::user_dict::list_dicts());
+        });
+        let result = rx
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        serde_json::to_string(&result).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    }
+
+    /// 读取一个用户词典的词条（关会话→导出→重建，在 wayland 线程执行）。
+    async fn list_dict_entries(&self, dict: String, query: String) -> zbus::fdo::Result<String> {
+        debug!("Received ListDictEntries request: {dict} query={query:?}");
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(crate::DaemonCommand::ListDictEntries(
+                dict, query, result_tx,
+            ))
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let result = result_rx
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        match result {
+            Ok(entries) => {
+                serde_json::to_string(&entries).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            }
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
 }

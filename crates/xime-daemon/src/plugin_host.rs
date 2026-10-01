@@ -99,6 +99,22 @@ impl PluginHost {
         }
     }
 
+    /// 表情面板数据：每分类的全部条目（无上限，分页由面板承担）。
+    pub fn emoji_panel_data(&self) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        for runtime in self.runtimes.values() {
+            for category in runtime.get_categories() {
+                let glyphs: Vec<String> = runtime
+                    .get_emojis(&category, "", usize::MAX)
+                    .into_iter()
+                    .map(|e| e.text)
+                    .collect();
+                out.push((category, glyphs));
+            }
+        }
+        out
+    }
+
     /// 从所有已加载 emoji 插件汇总表情候选。
     pub fn query_emojis(&self, search_text: &str, top_k: usize) -> Vec<EmojiItem> {
         let mut out = Vec::new();

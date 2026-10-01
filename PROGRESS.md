@@ -1,11 +1,40 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**rime 数据目录迁移单目录模型（对齐 XimeYao）：方案来源统一、升级语义落地，
-真机迁移无损**（2026-10-01）。XimeYao 移植 9/10（P0-P9 完成，P10 语音留待
-下轮）；UI 冻结审查修复 2 处。
+**候选栏面板按 XimeYao 现状完全重写（M1-M4 全部完成，待用户实机测试）**
+（2026-10-01 深夜）。XimeYao 移植 9/10（P0-P9 完成，P10 语音留待下轮）；
+候选栏菜单 UI/交互与 Windows 版对齐（6 卡片菜单 + 列表/网格子页 + 最近使用）。
 
-## 本次变更（2026-10-01 晚）：单目录模型迁移（详见 DECISIONS.md 同日条目）
+## 本次变更（2026-10-01 深夜）：候选栏面板完全重写（分支 panel-ximeyao-rewrite）
+
+背景：用户反馈"候选栏菜单功能和 Windows 行为和 UI 都不一样"，要求**完全
+重新移植，功能存在也要重新看**。旧实现（SearchPanel 搜索式表情面板 +
+ListPanel 列表面板）整体废弃，按 XimeYao 现状重写：
+
+- **xime-ui/menu.rs**（全新）：`PanelPage` 路由（Menu/Clipboard/QuickSend/
+  Emoji/Symbol）、6 卡片菜单（📋🚀😀🔣🎙️⚙️）、列表子页（6 行/页 40 字截断
+  + 编码列 + 翻页条）、网格子页（8×4 + 底部标签栏 表情 1 行/符号多行 9 列、
+  最近使用标签）、`panel_hit` 纯函数（绘制与命中同一几何）；几何常量 1:1
+  对齐 XimeYao（PANEL_HEADER_HEIGHT=36 等）
+- **xime-ui/iced_view.rs**：draw_panel 按页渲染（页头返回钮/卡片页/列表页/
+  网格页/标签栏/翻页条/品牌条）；neutral_row_bg 修复为主题色混合（原硬编码
+  白底，暗色主题下错误）
+- **xime-wayland**：ImBackend trait 换成 `show_panel(page,list,grid)`/
+  `hide_panel()`，v1/v2 高度按页计算、宽度不小于 PANEL_MIN_WIDTH
+- **xime-daemon**：PanelState{Closed,Open(page)} + PanelData 权威状态；
+  open_panel_page（进页 reload 一次数据：剪贴板开页 pullOnce、表情重载
+  插件、符号内置表）/ refresh_grid_cells / close_panel / load_panel_list；
+  按键语义对齐 XimeYao 桌面（Esc 关、`;` 上屏分号面板保持、可打印键收起
+  继续输入、修饰键不收起）；**`;` 中文态无组合时打开表情页**（重写中曾
+  丢失，已从 main 恢复并补上 ascii/组合态门控）；网格点击上屏 + LRU
+  recent_usage（32 条，JSON 落盘）+ 面板保持打开
+- **测试**：menu.rs 几何/翻页/命中、daemon refresh_grid_cells 联动翻页/
+  切标签；全仓 183 tests 通过，clippy -D warnings 干净
+- **插队核对项核对结果**：「剪贴板拉取内容不入历史」代码已解决
+  （handle_pull → upsert_and_trim 入库 + 回声抑制）；「中文态 Shift+符号键」
+  维持待实测（rime-wubi 子模块已带 Shift 保持 commit_code 修复）
+
+## 上次变更（2026-10-01 晚）：单目录模型迁移（详见 DECISIONS.md 同日条目）
 
 - libximecore 新增 `xime_config::ensure_bundled_rime_data`（移植 XimeYao
   `ensure_rime_data`）：首装全量、升级强更非 custom、弃用方案不强更；4 组单测

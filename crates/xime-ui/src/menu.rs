@@ -28,7 +28,6 @@ pub fn menu_button_hit(x: i32, y: i32, panel_width: u32, bar_height: u32) -> boo
     x >= start && x < panel_width as i32 && y >= 0 && y < bar_height as i32
 }
 
-
 /// 面板标题栏高（列表/网格子页顶部：← 菜单 + 标题）。
 pub const PANEL_HEADER_HEIGHT: u32 = 36;
 /// 菜单卡片 / 列表行 / 翻页条行高。
@@ -122,7 +121,7 @@ pub fn grid_tab_rows(tab_count: usize) -> usize {
 /// 标签栏总高。
 pub fn grid_tab_height_total(tab_count: usize) -> u32 {
     let rows = grid_tab_rows(tab_count) as u32;
-    rows * GRID_TAB_HEIGHT + (rows - 1).max(0) * GRID_TAB_GAP
+    rows * GRID_TAB_HEIGHT + rows.saturating_sub(1) * GRID_TAB_GAP
 }
 
 /// 网格页翻页条的 y（只有需要翻页的页才有这一行）。
@@ -307,7 +306,12 @@ pub fn menu_panel_height() -> u32 {
 /// 「← 菜单」返回按钮矩形（子页标题栏内，面板内坐标）。
 pub fn panel_back_rect() -> (u32, u32, u32, u32) {
     let y = (PANEL_HEADER_HEIGHT - PANEL_BACK_HEIGHT) / 2;
-    (PANEL_H_INSET, y, PANEL_H_INSET + PANEL_BACK_WIDTH, y + PANEL_BACK_HEIGHT)
+    (
+        PANEL_H_INSET,
+        y,
+        PANEL_H_INSET + PANEL_BACK_WIDTH,
+        y + PANEL_BACK_HEIGHT,
+    )
 }
 
 // ── 列表子页数据 ────────────────────────────────────────────────
@@ -350,12 +354,16 @@ impl PanelList {
     /// 当前页可见行数。
     pub fn rows_on_page(&self) -> usize {
         let start = self.clamped_page() * LIST_ROWS_PER_PAGE;
-        self.items.len().saturating_sub(start).min(LIST_ROWS_PER_PAGE)
+        self.items
+            .len()
+            .saturating_sub(start)
+            .min(LIST_ROWS_PER_PAGE)
     }
 
     /// 当前页第 row 行的条目。
     pub fn item_at(&self, row: usize) -> Option<&PanelListItem> {
-        self.items.get(self.clamped_page() * LIST_ROWS_PER_PAGE + row)
+        self.items
+            .get(self.clamped_page() * LIST_ROWS_PER_PAGE + row)
     }
 
     /// 是否有条目带触发编码（决定快捷发送页是否留出编码列）。
@@ -460,6 +468,17 @@ impl PanelGrid {
         self.cells.get(slot).and_then(|c| c.as_deref())
     }
 
+    /// 切到第 `tab` 个分类标签（回到该类第一页）；重复点当前标签不动作。
+    pub fn select_tab(&mut self, tab: usize) -> bool {
+        if tab < self.tab_count() && tab != self.tab {
+            self.tab = tab;
+            self.page = 0;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn has_prev_page(&self) -> bool {
         self.clamped_page() > 0
     }
@@ -515,12 +534,16 @@ pub enum PanelHit {
 /// 翻页条两个按钮的矩形（页脚行内，右侧对齐：下一页在最右，上一页在其左）。
 /// `index`：0 = 下一页、1 = 上一页（与 XimeYao footer_page_button_rect 同序）。
 pub fn pager_button_rect(panel_width: u32, footer_y: u32, index: u32) -> (u32, u32, u32, u32) {
-    let next_x = panel_width
-        .saturating_sub(PANEL_H_INSET + LIST_PAGE_BUTTON_WIDTH);
+    let next_x = panel_width.saturating_sub(PANEL_H_INSET + LIST_PAGE_BUTTON_WIDTH);
     let prev_x = next_x.saturating_sub(LIST_PAGE_BUTTON_WIDTH + 8);
     let x = if index == 0 { next_x } else { prev_x };
     let y = footer_y + (LIST_FOOTER_HEIGHT - LIST_PAGE_BUTTON_HEIGHT) / 2;
-    (x, y, x + LIST_PAGE_BUTTON_WIDTH, y + LIST_PAGE_BUTTON_HEIGHT)
+    (
+        x,
+        y,
+        x + LIST_PAGE_BUTTON_WIDTH,
+        y + LIST_PAGE_BUTTON_HEIGHT,
+    )
 }
 
 /// 翻页条页码标签矩形（两按钮之间）。
@@ -528,7 +551,12 @@ pub fn pager_label_rect(panel_width: u32, footer_y: u32) -> (u32, u32, u32, u32)
     let (_, _, next_x, _) = pager_button_rect(panel_width, footer_y, 0);
     let (prev_x, _, _, _) = pager_button_rect(panel_width, footer_y, 1);
     let y = footer_y + (LIST_FOOTER_HEIGHT - LIST_PAGE_BUTTON_HEIGHT) / 2;
-    (prev_x + LIST_PAGE_BUTTON_WIDTH, y, next_x, y + LIST_PAGE_BUTTON_HEIGHT)
+    (
+        prev_x + LIST_PAGE_BUTTON_WIDTH,
+        y,
+        next_x,
+        y + LIST_PAGE_BUTTON_HEIGHT,
+    )
 }
 
 /// 面板命中测试（绘制几何与点击共用的唯一布局来源）。
@@ -591,10 +619,14 @@ pub fn panel_hit(
             }
             if live && has_pager && grid.page_count() > 1 {
                 let footer_y = grid_footer_y();
-                if grid.has_prev_page() && rect_contains(pager_button_rect(panel_width, footer_y, 1), x, y) {
+                if grid.has_prev_page()
+                    && rect_contains(pager_button_rect(panel_width, footer_y, 1), x, y)
+                {
                     return Some(PanelHit::PrevPage);
                 }
-                if grid.has_next_page() && rect_contains(pager_button_rect(panel_width, footer_y, 0), x, y) {
+                if grid.has_next_page()
+                    && rect_contains(pager_button_rect(panel_width, footer_y, 0), x, y)
+                {
                     return Some(PanelHit::NextPage);
                 }
             }
@@ -663,10 +695,10 @@ mod tests {
         let h = menu_panel_height();
         // 3 行卡片 32 + 行距 4（末行扣回）+ 顶部 10 + 间距 8 + 品牌条 32 + 底 8。
         assert_eq!(h, 10 + 3 * 36 - 4 + 8 + 32 + 8);
-        let (x0, y0, x1, y1) = menu_card_rect(0, 320);
+        let (x0, y0, x1, _) = menu_card_rect(0, 320);
         assert_eq!((x0, y0), (10, 10));
         assert_eq!(x1 - x0, (320 - 20 - 8) / 2);
-        let (x0, y0, _, _) = menu_card_rect(1, 320);
+        let (x0, _, _, _) = menu_card_rect(1, 320);
         assert!(x0 > 150, "第 2 列在右侧");
         let (_, y0, _, _) = menu_card_rect(2, 320);
         assert_eq!(y0, 10 + 36, "第 2 行从首行下开始");
@@ -679,7 +711,10 @@ mod tests {
         let mut list = PanelList {
             source: PanelPage::Clipboard,
             items: (0..8)
-                .map(|i| PanelListItem { text: format!("t{i}"), code: String::new() })
+                .map(|i| PanelListItem {
+                    text: format!("t{i}"),
+                    code: String::new(),
+                })
                 .collect(),
             page: 0,
         };
@@ -705,13 +740,23 @@ mod tests {
         // 菜单页第 0 张卡片中心。
         let (x0, y0, x1, y1) = menu_card_rect(0, 320);
         assert_eq!(
-            panel_hit(PanelPage::Menu, 320, &list, &grid, (x0 + x1) / 2, (y0 + y1) / 2),
+            panel_hit(
+                PanelPage::Menu,
+                320,
+                &list,
+                &grid,
+                (x0 + x1) / 2,
+                (y0 + y1) / 2
+            ),
             Some(PanelHit::MenuItem(MenuCard::Clipboard))
         );
         // 空列表页：行不可点，但返回按钮可点。
         let hits = panel_hit(PanelPage::Clipboard, 320, &list, &grid, 40, 24);
         assert_eq!(hits, Some(PanelHit::Back));
-        assert_eq!(panel_hit(PanelPage::Clipboard, 320, &list, &grid, 200, 100), None);
+        assert_eq!(
+            panel_hit(PanelPage::Clipboard, 320, &list, &grid, 200, 100),
+            None
+        );
     }
 
     #[test]
@@ -719,7 +764,10 @@ mod tests {
         let mut list = PanelList {
             source: PanelPage::QuickSend,
             items: (0..8)
-                .map(|i| PanelListItem { text: format!("t{i}"), code: format!("c{i}") })
+                .map(|i| PanelListItem {
+                    text: format!("t{i}"),
+                    code: format!("c{i}"),
+                })
                 .collect(),
             page: 0,
         };
@@ -734,19 +782,40 @@ mod tests {
         let footer_y = list_row_y(LIST_ROWS_PER_PAGE) + PANEL_CONTENT_GAP;
         let (bx, by, _, by1) = pager_button_rect(320, footer_y, 0);
         assert_eq!(
-            panel_hit(PanelPage::QuickSend, 320, &list, &grid, bx + 5, by + (by1 - by) / 2),
+            panel_hit(
+                PanelPage::QuickSend,
+                320,
+                &list,
+                &grid,
+                bx + 5,
+                by + (by1 - by) / 2
+            ),
             Some(PanelHit::NextPage)
         );
         assert!(list.next_page());
         // 末页下一页不可命中。
         assert_eq!(
-            panel_hit(PanelPage::QuickSend, 320, &list, &grid, bx + 5, by + (by1 - by) / 2),
+            panel_hit(
+                PanelPage::QuickSend,
+                320,
+                &list,
+                &grid,
+                bx + 5,
+                by + (by1 - by) / 2
+            ),
             None
         );
         // 上一页可命中。
         let (px, py, _, py1) = pager_button_rect(320, footer_y, 1);
         assert_eq!(
-            panel_hit(PanelPage::QuickSend, 320, &list, &grid, px + 5, py + (py1 - py) / 2),
+            panel_hit(
+                PanelPage::QuickSend,
+                320,
+                &list,
+                &grid,
+                px + 5,
+                py + (py1 - py) / 2
+            ),
             Some(PanelHit::PrevPage)
         );
     }

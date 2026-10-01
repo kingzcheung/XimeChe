@@ -3,6 +3,7 @@ mod command;
 mod custom_phrase;
 mod daemon;
 mod plugin_host;
+mod recent_usage;
 mod rime;
 mod schema_dict;
 mod symbols;

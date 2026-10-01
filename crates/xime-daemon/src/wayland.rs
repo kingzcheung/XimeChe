@@ -355,7 +355,20 @@ impl WaylandLoop {
                 }
                 Ok(DaemonCommand::Deploy) => {
                     debug!("Deploy command received, starting Rime deployment...");
-                    rime.redeploy();
+                    let result = rime.redeploy_with_result();
+                    let (summary, body) = match result {
+                        librime::DeployResult::Success => {
+                            ("部署完成".to_string(), "Rime 配置已重新加载".to_string())
+                        }
+                        librime::DeployResult::Failure => (
+                            "部署失败".to_string(),
+                            "Rime 部署返回失败，请检查 xime.log 或配置文件".to_string(),
+                        ),
+                    };
+                    let handle = self.rt_handle.clone();
+                    handle.spawn(async move {
+                        notify_desktop(&summary, &body).await;
+                    });
                 }
                 Ok(DaemonCommand::ReloadStyle) => {
                     debug!("ReloadStyle command received, reloading xime config...");
@@ -1849,6 +1862,36 @@ impl WaylandLoop {
             }
         }
         true
+    }
+}
+
+/// 发 freedesktop 桌面通知（org.freedesktop.Notifications，KDE/GNOME 标准）。
+/// 对齐 XimeYao 的部署结果 toast：失败也通知（用户能看到部署按钮没白点）。
+async fn notify_desktop(summary: &str, body: &str) {
+    let Ok(conn) = zbus::Connection::session().await else {
+        debug!("Desktop notification: no session bus");
+        return;
+    };
+    let result = conn
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &(
+                "xime",           // app_name
+                0u32,             // replaces_id
+                "input-keyboard", // app_icon（主题图标）
+                summary,
+                body,
+                Vec::<String>::new(), // actions
+                std::collections::HashMap::<String, zbus::zvariant::Value>::new(), // hints
+                4000i32,              // expire_timeout (ms)
+            ),
+        )
+        .await;
+    if let Err(e) = result {
+        debug!("Desktop notification failed: {}", e);
     }
 }
 

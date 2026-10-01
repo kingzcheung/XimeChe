@@ -171,6 +171,11 @@ impl RimeEngine {
     }
 
     pub fn redeploy(&mut self) {
+        let _ = self.redeploy_with_result();
+    }
+
+    /// 重新部署并返回结果（托盘「重新部署」后发桌面通知用）。
+    pub fn redeploy_with_result(&mut self) -> librime::DeployResult {
         debug!("Redeploying Rime...");
         librime::finalize();
 
@@ -181,10 +186,12 @@ impl RimeEngine {
         traits.set_log_dir(&self.config_dir);
 
         librime::setup(&mut traits);
-        if let Err(e) = librime::initialize(&mut traits) {
+        let result = if let Err(e) = librime::initialize(&mut traits) {
             error!("Failed to reinitialize Rime: {}", e);
+            librime::DeployResult::Failure
         } else {
-            match librime::full_deploy_and_wait() {
+            let result = librime::full_deploy_and_wait();
+            match result {
                 librime::DeployResult::Success => debug!("Rime redeployed successfully"),
                 librime::DeployResult::Failure => warn!("Rime deploy failed"),
             }
@@ -195,7 +202,9 @@ impl RimeEngine {
 
             self.session = librime::create_session().ok();
             debug!("New Rime session created after deployment");
-        }
+            result
+        };
+        result
     }
 }
 

@@ -2,7 +2,9 @@ use std::fs::File;
 use std::path::PathBuf;
 use xime_setup_lib::state::{DictEntriesResult, DictListResult};
 use xime_setup_lib::{
-    set_notify_deploy, set_notify_dict_entries, set_notify_dict_list, set_notify_reload_plugins,
+    set_notify_deploy, set_notify_dict_backup, set_notify_dict_entries,
+    set_notify_dict_entry_write, set_notify_dict_export, set_notify_dict_import,
+    set_notify_dict_list, set_notify_dict_restore, set_notify_reload_plugins,
     set_notify_reload_style, set_notify_select_schema,
 };
 
@@ -42,6 +44,32 @@ fn dict_list_from_json(json: &str) -> Option<DictListResult> {
 
 fn dict_entries_from_json(json: &str) -> Option<DictEntriesResult> {
     serde_json::from_str(json).ok()
+}
+
+/// 调 daemon 的 UserDictOp（op 为 UserDictOp 的 JSON），返回条数。
+fn user_dict_op_json(op_json: String) -> Option<i64> {
+    let conn = zbus::blocking::Connection::session().ok()?;
+    let reply = conn
+        .call_method(
+            Some("org.xime.Xime"),
+            "/org/xime/Xime",
+            Some("org.xime.Xime.Controller"),
+            "UserDictOp",
+            &(op_json,),
+        )
+        .ok()?;
+    reply.body().deserialize::<i64>().ok()
+}
+
+/// 拼一个字符串字段版的 UserDictOp JSON（值做 JSON 转义）。
+fn op_json(op: &str, kvs: &[(&str, String)]) -> String {
+    let mut s = format!(r#"{{"op":"{op}""#);
+    for (k, v) in kvs {
+        let v = v.replace('\\', "\\\\").replace('"', "\\\"");
+        s.push_str(&format!(r#","{k}":"{v}""#));
+    }
+    s.push('}');
+    s
 }
 
 fn get_lock_file_path() -> PathBuf {
@@ -142,6 +170,37 @@ fn main() -> iced::Result {
     set_notify_dict_entries(|dict, query| {
         daemon_call_json2("ListDictEntries", dict, query)
             .and_then(|json| dict_entries_from_json(&json))
+    });
+    // 写路径：单一 UserDictOp 方法（参数为 op 的 JSON，返回条数；失败走 DBus 错误）。
+    // 注意：set_notify_* 接收 fn 指针，helper 必须是无捕获的独立函数。
+    set_notify_dict_backup(|dict| {
+        user_dict_op_json(op_json("backup", &[("dict", dict.to_string())])).is_some()
+    });
+    set_notify_dict_restore(|path| {
+        user_dict_op_json(op_json("restore", &[("path", path.to_string())])).is_some()
+    });
+    set_notify_dict_export(|dict, path| {
+        user_dict_op_json(op_json(
+            "export",
+            &[("dict", dict.to_string()), ("path", path.to_string())],
+        ))
+        .map(|n| n as i32)
+    });
+    set_notify_dict_import(|dict, path| {
+        user_dict_op_json(op_json(
+            "import",
+            &[("dict", dict.to_string()), ("path", path.to_string())],
+        ))
+        .map(|n| n as i32)
+    });
+    set_notify_dict_entry_write(|dict, word, code, commits| {
+        let json = format!(
+            r#"{{"op":"write_entry","dict":"{}","word":"{}","code":"{}","commits":{commits}}}"#,
+            dict.replace('\\', "\\\\").replace('"', "\\\""),
+            word.replace('\\', "\\\\").replace('"', "\\\""),
+            code.replace('\\', "\\\\").replace('"', "\\\""),
+        );
+        user_dict_op_json(json).map(|n| n as i32)
     });
 
     // 注入应用元数据（目录沿用 xime，librime 分发标识为 XimeChe）。

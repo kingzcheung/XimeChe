@@ -126,4 +126,21 @@ impl XimeDaemon {
             Err(e) => Err(zbus::fdo::Error::Failed(e)),
         }
     }
+
+    /// 用户词典写操作（造词/删除/备份/恢复/导出/导入），wayland 线程
+    /// `with_user_dict_closed` 内执行。参数为 UserDictOp 的 JSON，返回条数
+    /// （Backup/Restore 成功 = 1）。
+    async fn user_dict_op(&self, op_json: String) -> zbus::fdo::Result<i64> {
+        debug!("Received UserDictOp request: {op_json:?}");
+        let op: crate::user_dict::UserDictOp = serde_json::from_str(&op_json)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("参数无效: {e}")))?;
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(crate::DaemonCommand::UserDictOp(op, result_tx))
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        result_rx
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .map_err(zbus::fdo::Error::Failed)
+    }
 }

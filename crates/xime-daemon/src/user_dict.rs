@@ -76,6 +76,10 @@ pub fn parse_user_dict_text(text: &str) -> Vec<DictEntryRow> {
         if commits < 0 {
             continue; // tombstone
         }
+        // 本机 librime 实测：墓碑还会导出为 `\x7f` 前缀编码 + commits=0 形态。
+        if code.chars().any(|c| c.is_control()) {
+            continue;
+        }
         out.push(DictEntryRow {
             word: word.to_string(),
             code: code.to_string(),
@@ -141,6 +145,111 @@ pub fn list_entries(dict: &str, query: &str) -> Result<DictEntriesResult, String
     })
 }
 
+// ---- 写路径（备份/恢复/导出/导入/造词/删除） ------------------------------
+
+/// 临时文件序列号（写路径）。
+static ENTRY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 用户词典 levers 操作（在 wayland 线程、`with_user_dict_closed` 内执行）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum UserDictOp {
+    /// 写入一条词条：commits > 0 新增、< 0 删除标记（tombstone）。
+    WriteEntry {
+        dict: String,
+        word: String,
+        code: String,
+        commits: i32,
+    },
+    /// 备份快照到 sync 目录。
+    Backup { dict: String },
+    /// 从快照文件恢复。
+    Restore { path: String },
+    /// 导出为文本（设置页经文件对话框选定保存路径）。
+    Export { dict: String, path: String },
+    /// 从文本合并导入。
+    Import { dict: String, path: String },
+}
+
+/// 校验一条用户词条的输入（对齐安卓 `checkEntryInput`）：词/码 trim 后非空、
+/// 不含制表/换行；频率非 0（> 0 新增、< 0 删除）。返回修剪后的 (词, 编码)。
+pub fn validate_entry(word: &str, code: &str, commits: i32) -> Result<(String, String), String> {
+    let word = word.trim();
+    let code = code.trim();
+    if word.is_empty() || code.is_empty() {
+        return Err("词和编码都要填".to_string());
+    }
+    for (label, value) in [("词", word), ("编码", code)] {
+        if value.contains('\t') || value.contains('\n') || value.contains('\r') {
+            return Err(format!("{label}不能含制表符或换行"));
+        }
+    }
+    if commits == 0 {
+        return Err("频率要填正整数（新增），删除走删除按钮".to_string());
+    }
+    Ok((word.to_string(), code.to_string()))
+}
+
+/// 一行码表文本（与安卓 `codeTableText` 一致：`词⇥码⇥频率⇥换行`）。
+fn entry_line(word: &str, code: &str, commits: i32) -> String {
+    format!("{word}\t{code}\t{commits}\n")
+}
+
+impl UserDictOp {
+    /// 执行操作，返回条数（Backup/Restore 成功返回 1）。
+    ///
+    /// **调用方必须保证此刻用户词典处于关闭状态**（user_dict_manager CAVEAT，
+    /// 即 `RimeEngine::with_user_dict_closed`）。
+    pub fn run(&self) -> Result<i64, String> {
+        let _gate = RIME_LEVERS_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        match self {
+            Self::WriteEntry {
+                dict,
+                word,
+                code,
+                commits,
+            } => {
+                let (word, code) = validate_entry(word, code, *commits)?;
+                let label = sanitize_dict_name(dict);
+                let path = std::env::temp_dir().join(format!(
+                    "xime_dict_entry_{label}_{}_{}.txt",
+                    std::process::id(),
+                    ENTRY_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::write(&path, entry_line(&word, &code, *commits).as_bytes())
+                    .map_err(|e| format!("写临时文件失败：{e}"))?;
+                let imported = librime::import_user_dict(dict, &path.to_string_lossy());
+                let _ = std::fs::remove_file(&path);
+                let imported = imported.map_err(|e| format!("导入用户词典失败：{e:?}"))?;
+                if imported <= 0 {
+                    return Err(
+                        "导入用户词典失败（librime 写入 0 条，词库可能正被占用）".to_string()
+                    );
+                }
+                Ok(imported as i64)
+            }
+            Self::Backup { dict } => {
+                librime::backup_user_dict(dict).map_err(|e| format!("备份失败：{e:?}"))?;
+                Ok(1)
+            }
+            Self::Restore { path } => {
+                librime::restore_user_dict(path).map_err(|e| format!("恢复失败：{e:?}"))?;
+                Ok(1)
+            }
+            Self::Export { dict, path } => {
+                let n = librime::export_user_dict(dict, path)
+                    .map_err(|e| format!("导出失败：{e:?}"))?;
+                Ok(n as i64)
+            }
+            Self::Import { dict, path } => {
+                let n = librime::import_user_dict(dict, path)
+                    .map_err(|e| format!("导入失败：{e:?}"))?;
+                Ok(n as i64)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +284,25 @@ mod tests {
                 commits: 0
             }
         );
+    }
+
+    /// 本机 librime 实测：墓碑导出为 `\x7f` 前缀编码 + commits=0。
+    #[test]
+    fn parse_filters_control_char_codes() {
+        let text = "正常词\tnormal\t5\n墓碑形\t\x7fenc\u{1f}xyz\t0\n";
+        let rows = parse_user_dict_text(text);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].code, "normal");
+    }
+
+    #[test]
+    fn validate_entry_rules() {
+        assert!(validate_entry("词", "ab", 1).is_ok());
+        assert!(validate_entry(" 词 ", " ab ", -1).is_ok());
+        assert!(validate_entry("", "ab", 1).is_err());
+        assert!(validate_entry("词", "", 1).is_err());
+        assert!(validate_entry("a\tb", "ab", 1).is_err());
+        assert!(validate_entry("词", "ab", 0).is_err());
     }
 
     #[test]

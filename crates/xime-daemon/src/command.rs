@@ -16,6 +16,12 @@ pub enum DaemonCommand {
         String,
         oneshot::Sender<Result<crate::user_dict::DictEntriesResult, String>>,
     ),
+    /// 用户词典 levers 写操作（造词/删除/备份/恢复/导出/导入）。同样在
+    /// wayland 线程 `with_user_dict_closed` 内执行。
+    UserDictOp(
+        crate::user_dict::UserDictOp,
+        oneshot::Sender<Result<i64, String>>,
+    ),
     /// 系统亮/暗色模式变化（portal color-scheme，true = 暗色）。
     DarkMode(bool),
     Shutdown,

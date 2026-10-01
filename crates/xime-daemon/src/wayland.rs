@@ -392,6 +392,11 @@ impl WaylandLoop {
                         .with_user_dict_closed(|| crate::user_dict::list_entries(&dict, &query));
                     let _ = result_tx.send(result);
                 }
+                Ok(DaemonCommand::UserDictOp(op, result_tx)) => {
+                    debug!("UserDictOp command received: {op:?}");
+                    let result = rime.with_user_dict_closed(|| op.run());
+                    let _ = result_tx.send(result);
+                }
                 Ok(DaemonCommand::Shutdown) => {
                     debug!("Shutdown requested, exiting process with status 0");
                     // 必须整进程退出：DBus 主循环不感知该命令；exit(0) 为正常

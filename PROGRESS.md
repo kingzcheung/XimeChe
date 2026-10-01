@@ -1,31 +1,43 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**XimeYao（Windows 版）功能移植进行中：P0 修复 Linux 构建、P1 词典管理读路径已完成**（2026-10-01）
+**XimeYao 功能移植 P0-P9 完成（9/10）**：词典管理读写、快捷短语、方案词表、
+用户资料同步、托盘方案菜单、部署通知、剪贴板 v4、插件配置加密全部端到端
+验证通过；仅剩 P10 语音转文本（待独立会话 + 用户配合麦克风实测）（2026-10-01）
 
-## XimeYao 功能移植计划（2026-10-01 立项，逐个功能点推进）
+## XimeYao 功能移植（2026-10-01，P0-P9 完成）
 
-libximecore 拉入词典管理（librime levers 封装）、xime-speech（sherpa-onnx）、
-插件配置加密（DPAPI）、剪贴板 DB v4 等新能力后，对照 XimeYao
-（github.com/ximeiorg/XimeYao）盘点出移植清单（按依赖与价值排序）：
+| # | 功能点 | 提交 | 验证 |
+|---|--------|------|------|
+| P0 | 修复 Linux 构建（词典机制解除 Windows 门控 → `any(windows, dict-page)`；sherpa default-members 隔离） | libximecore 9c25bb1 | 两仓构建全绿 |
+| P1 | 词典读路径（DBus ListUserDicts/ListDictEntries + with_user_dict_closed） | 70aa2c0 / d3d11ca | wubi86 96120 条 0.25s |
+| P2 | 词典写路径（UserDictOp：造词/删除 tombstone/备份/恢复/导出/导入） | a9569d5 | 造词→查→删→导出→备份→导入全链路 |
+| P3 | 快捷短语（custom_phrase 整表编辑 + translator patch 注入） | c38b57e | 保存→patch 注入→Deploy |
+| P4 | 方案词表只读浏览（BFS 合并 + 签名缓存） | 30ba3b9 | 91397 条，冷读 42ms/缓存 17ms |
+| P5 | rime 用户资料同步（UserDictOp::Sync + backup 页启用） | 7e71d3b | sync 快照生成，会话恢复 |
+| P6 | 托盘方案切换菜单（当前项 ✓，点击切换） | 5c3852b | 已上线（托盘目视待用户） |
+| P7 | 部署结果桌面通知（freedesktop Notifications） | 6f024ce | Deploy 无错（弹窗待目视） |
+| P8 | 剪贴板 DB v3→v4（Android 对齐：图片/类型 7 列 + imageHash 索引） | 9ac1b44 | 真机 DB 迁移 v4、老数据完好 |
+| P9 | 插件配置加密 Linux keyring（Secret Service，AES-256-GCM 同格式） | libximecore a4d772d | 实机 enc: 加密+解密（KDE Wallet） |
 
-| # | 功能点 | 状态 |
-|---|--------|------|
-| P0 | 修复 Linux 构建（词典机制解除 Windows 门控 → `any(windows, dict-page)` feature；sherpa-onnx 经 default-members 隔离；cipher 平台测试/lint） | ✅ libximecore 9c25bb1 |
-| P1 | 词典管理·读路径：DBus ListUserDicts/ListDictEntries + setup 词典页接线 | ✅ 70aa2c0 |
-| P2 | 词典管理·写路径：新增/删除词条（tombstone）、备份/恢复/导出/导入 | 待做 |
-| P3 | 快捷短语：custom_phrase 整表编辑 + translator patch 注入 | 待做 |
-| P4 | 方案词表只读浏览：import_tables BFS + 签名缓存 | 待做 |
-| P5 | rime 用户资料同步：DBus SyncUserData + 同步页卡片 + 托盘菜单 | 待做 |
-| P6 | 托盘菜单方案 switches | 待做 |
-| P7 | 部署结果桌面通知（freedesktop Notifications） | 待做 |
-| P8 | 剪贴板 DB v4 对齐（xime-clipboard 还是 v3） | 待做 |
-| P9 | 插件配置加密 Linux 后端（keyring；现为明文直通） | 待做 |
-| P10 | 语音转文本（xime-speech + 模型下载 + PipeWire/ALSA 采集） | 待做 |
+**P10 语音转文本——下一个功能点**（本会话不做：端到端验证需用户对麦克风
+说话，无法独立闭环）。实施蓝图：
+- 原生库障碍已排除：sherpa-onnx-sys 1.13.8 build.rs 支持自动下载
+  linux-x64 预编译库（shared ~XXMB，缓存在 target/sherpa-onnx-prebuilt）
+- 链路：daemon 集成 xime-speech（StreamingRecognizer：装载→喂 pcm16→
+  partial→finalize）；音频采集需选型（alsa crate 或 pipewire，16kHz mono
+  pcm16 块喂流）；voice 页照词典页模式解除 windows 门控（speech_models 的
+  server IPC 回调改 DBus 注入）；模型下载走 daemon（dbus 流度上报）
+- XimeYao 参考：`winxime-server` speech 模块 + libximecore voice.rs UI
 
-**不做**：计算器（XimeYao 实机事故后已下线）；候选栏子页（已有等价实现）。
-**插队核对项**：「中文态 Shift+符号键无法上屏」「剪贴板拉取内容不入历史」
-两个 XimeYao bug 是否在 Linux 同样存在。
+**插队核对项**（XimeYao 修过的 bug，Linux 是否同现待实测）：
+「中文态 Shift+符号键无法上屏」「剪贴板拉取内容不入历史」。
+
+**移植过程中实锤的两个跨平台差异**：
+- librime levers 导出要求 userdb 独占（同进程会话持有 LevelDB 锁，
+  必须关会话→导出→重建；XimeYao P1 读路径没关会话是侥幸）
+- XimeChe 双目录模型：方案码表在只读 shared 目录，user 目录只有用户数据
+  （XimeYao 单目录无此问题）——schema_dict 需要目录数组回退查找
 
 ## P1 实现要点（2026-10-01）
 

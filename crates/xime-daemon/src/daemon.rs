@@ -175,4 +175,22 @@ impl XimeDaemon {
             Err(e) => Err(zbus::fdo::Error::Failed(e)),
         }
     }
+
+    /// 读取某方案的词表词条（只读，纯文件操作 + 进程内缓存）。
+    async fn list_schema_entries(
+        &self,
+        schema_id: String,
+        query: String,
+    ) -> zbus::fdo::Result<String> {
+        debug!("Received ListSchemaEntries request: {schema_id} query={query:?}");
+        // 双目录模型：user 优先（方案包安装位），回退只读 shared（内置方案）。
+        let (shared, user) = xime_config::get_data_dirs();
+        let result = crate::schema_dict::read_schema_dict(&[user, shared], &schema_id, &query);
+        match result {
+            Ok(read) => {
+                serde_json::to_string(&read).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            }
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
 }

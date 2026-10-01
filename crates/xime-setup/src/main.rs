@@ -2,12 +2,14 @@ use std::fs::File;
 use std::path::PathBuf;
 use xime_setup_lib::state::{
     CustomPhraseRow, DictEntriesResult, DictListResult, PhraseListResult, PhraseSaveResult,
+    SchemaEntriesResult,
 };
 use xime_setup_lib::{
     set_notify_deploy, set_notify_dict_backup, set_notify_dict_entries,
     set_notify_dict_entry_write, set_notify_dict_export, set_notify_dict_import,
     set_notify_dict_list, set_notify_dict_restore, set_notify_phrase_list, set_notify_phrase_save,
-    set_notify_reload_plugins, set_notify_reload_style, set_notify_select_schema,
+    set_notify_reload_plugins, set_notify_reload_style, set_notify_schema_entries,
+    set_notify_select_schema,
 };
 
 /// 调 daemon 的无参 DBus 方法并返回 JSON 应答文本。
@@ -238,6 +240,12 @@ fn main() -> iced::Result {
     // 快捷短语（词典页第二个 Tab）：读取/整表保存，纯文件操作走 DBus JSON。
     set_notify_phrase_list(phrase_list_cb);
     set_notify_phrase_save(phrase_save_cb);
+    // 方案词表（输入方案页第三个 Tab）：只读浏览。
+    set_notify_schema_entries(|schema_id, query| {
+        daemon_call_json2_err("ListSchemaEntries", schema_id, query)
+            .ok()
+            .and_then(|json| serde_json::from_str::<SchemaEntriesResult>(&json).ok())
+    });
 
     // 注入应用元数据（目录沿用 xime，librime 分发标识为 XimeChe）。
     let _ = xime_setup_lib::set_app_metadata(xime_setup_lib::AppMetadata {

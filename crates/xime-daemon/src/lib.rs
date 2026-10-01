@@ -4,6 +4,7 @@ mod custom_phrase;
 mod daemon;
 mod plugin_host;
 mod rime;
+mod schema_dict;
 mod symbols;
 mod user_dict;
 mod wayland;

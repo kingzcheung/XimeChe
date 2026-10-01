@@ -1,9 +1,29 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**XimeYao 功能移植 P0-P9 完成（9/10）**：词典管理读写、快捷短语、方案词表、
-用户资料同步、托盘方案菜单、部署通知、剪贴板 v4、插件配置加密全部端到端
-验证通过；仅剩 P10 语音转文本（待独立会话 + 用户配合麦克风实测）（2026-10-01）
+**rime 数据目录迁移单目录模型（对齐 XimeYao）：方案来源统一、升级语义落地，
+真机迁移无损**（2026-10-01）。XimeYao 移植 9/10（P0-P9 完成，P10 语音留待
+下轮）；UI 冻结审查修复 2 处。
+
+## 本次变更（2026-10-01 晚）：单目录模型迁移（详见 DECISIONS.md 同日条目）
+
+- libximecore 新增 `xime_config::ensure_bundled_rime_data`（移植 XimeYao
+  `ensure_rime_data`）：首装全量、升级强更非 custom、弃用方案不强更；4 组单测
+- daemon/setup 启动时部署随包数据源 → `set_rime_paths(shared==user==rime 目录)`
+- `schema_dict` 去掉目录数组回退（P4 的临时补丁），回单目录签名
+- 真机迁移：方案文件全量落位 user 目录；userdb 96120 条词库、
+  wubi86.custom.yaml、custom_phrase.txt 无损；词表 91397 条 40ms 正常
+
+## UI 冻结审查与修复（2026-10-01 晚，libximecore 7fb9519）
+
+审查全部 notify_* 回调调用上下文，修复两处实锤 UI 线程阻塞：
+1. **RimeSyncNow**：iced update() 里同步等 DBus（0.66s~数秒）→ 后台线程 +
+   RIME_SYNC_OUTCOME 信箱 + poll_background 回收；syncing 置灰防重入
+2. **rfd 文件对话框**（词典恢复/导出/导入）：Linux xdg-portal 对话框是独立
+   窗口，阻塞调用冻结设置窗口 → file_dialog 模块后台选路径 + 信箱 +
+   IN_FLIGHT 防连点；Windows 保持原生模态不变
+其余回调核实全部在 std::thread::spawn 内；已知接受的阻塞（切方案毫秒级
+快速路径、daemon levers 操作期间按键暂停）记录在案。
 
 ## XimeYao 功能移植（2026-10-01，P0-P9 完成）
 

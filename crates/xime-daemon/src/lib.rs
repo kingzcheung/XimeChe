@@ -1,5 +1,6 @@
 mod clipboard_sync;
 mod command;
+mod custom_phrase;
 mod daemon;
 mod plugin_host;
 mod rime;

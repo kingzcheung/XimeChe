@@ -143,4 +143,36 @@ impl XimeDaemon {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
             .map_err(zbus::fdo::Error::Failed)
     }
+
+    /// 读取某方案的快捷短语表（纯文件操作，直接执行）。
+    async fn list_custom_phrases(&self, schema_id: String) -> zbus::fdo::Result<String> {
+        debug!("Received ListCustomPhrases request: {schema_id}");
+        let result = crate::custom_phrase::list_phrases(&crate::get_config_dir(), &schema_id);
+        match result {
+            Ok(list) => {
+                serde_json::to_string(&list).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            }
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
+
+    /// 整表保存某方案的快捷短语（写文件 + 视需要注入 patch；不部署）。
+    async fn save_custom_phrases(
+        &self,
+        schema_id: String,
+        entries_json: String,
+    ) -> zbus::fdo::Result<String> {
+        debug!("Received SaveCustomPhrases request: {schema_id}");
+        let entries: Vec<crate::custom_phrase::CustomPhraseEntry> =
+            serde_json::from_str(&entries_json)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("参数无效: {e}")))?;
+        let result =
+            crate::custom_phrase::save_phrases(&crate::get_config_dir(), &schema_id, &entries);
+        match result {
+            Ok(saved) => {
+                serde_json::to_string(&saved).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            }
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
 }

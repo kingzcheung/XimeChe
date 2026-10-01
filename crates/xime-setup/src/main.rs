@@ -1,11 +1,13 @@
 use std::fs::File;
 use std::path::PathBuf;
-use xime_setup_lib::state::{DictEntriesResult, DictListResult};
+use xime_setup_lib::state::{
+    CustomPhraseRow, DictEntriesResult, DictListResult, PhraseListResult, PhraseSaveResult,
+};
 use xime_setup_lib::{
     set_notify_deploy, set_notify_dict_backup, set_notify_dict_entries,
     set_notify_dict_entry_write, set_notify_dict_export, set_notify_dict_import,
-    set_notify_dict_list, set_notify_dict_restore, set_notify_reload_plugins,
-    set_notify_reload_style, set_notify_select_schema,
+    set_notify_dict_list, set_notify_dict_restore, set_notify_phrase_list, set_notify_phrase_save,
+    set_notify_reload_plugins, set_notify_reload_style, set_notify_select_schema,
 };
 
 /// 调 daemon 的无参 DBus 方法并返回 JSON 应答文本。
@@ -44,6 +46,37 @@ fn dict_list_from_json(json: &str) -> Option<DictListResult> {
 
 fn dict_entries_from_json(json: &str) -> Option<DictEntriesResult> {
     serde_json::from_str(json).ok()
+}
+
+/// 调 daemon 的双字符串参数 DBus 方法，错误透传（设置页要展示原因）。
+fn daemon_call_json2_err(method: &str, a: &str, b: &str) -> Result<String, String> {
+    let conn = zbus::blocking::Connection::session().map_err(|e| e.to_string())?;
+    let reply = conn
+        .call_method(
+            Some("org.xime.Xime"),
+            "/org/xime/Xime",
+            Some("org.xime.Xime.Controller"),
+            method,
+            &(a, b),
+        )
+        .map_err(|e| e.to_string())?;
+    reply
+        .body()
+        .deserialize::<String>()
+        .map_err(|e| e.to_string())
+}
+
+fn phrase_list_cb(schema_id: &str) -> Option<PhraseListResult> {
+    daemon_call_json2_err("ListCustomPhrases", schema_id, "")
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+}
+
+fn phrase_save_cb(schema_id: &str, entries: &[CustomPhraseRow]) -> Option<PhraseSaveResult> {
+    let entries_json = serde_json::to_string(entries).ok()?;
+    daemon_call_json2_err("SaveCustomPhrases", schema_id, &entries_json)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
 }
 
 /// 调 daemon 的 UserDictOp（op 为 UserDictOp 的 JSON），返回条数。
@@ -202,6 +235,9 @@ fn main() -> iced::Result {
         );
         user_dict_op_json(json).map(|n| n as i32)
     });
+    // 快捷短语（词典页第二个 Tab）：读取/整表保存，纯文件操作走 DBus JSON。
+    set_notify_phrase_list(phrase_list_cb);
+    set_notify_phrase_save(phrase_save_cb);
 
     // 注入应用元数据（目录沿用 xime，librime 分发标识为 XimeChe）。
     let _ = xime_setup_lib::set_app_metadata(xime_setup_lib::AppMetadata {

@@ -183,9 +183,9 @@ impl XimeDaemon {
         query: String,
     ) -> zbus::fdo::Result<String> {
         debug!("Received ListSchemaEntries request: {schema_id} query={query:?}");
-        // 双目录模型：user 优先（方案包安装位），回退只读 shared（内置方案）。
-        let (shared, user) = xime_config::get_data_dirs();
-        let result = crate::schema_dict::read_schema_dict(&[user, shared], &schema_id, &query);
+        // 单目录模型：方案文件与用户数据同一目录（启动时已部署）。
+        let result =
+            crate::schema_dict::read_schema_dict(&crate::get_config_dir(), &schema_id, &query);
         match result {
             Ok(read) => {
                 serde_json::to_string(&read).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))

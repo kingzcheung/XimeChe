@@ -260,8 +260,20 @@ fn main() -> iced::Result {
         version: env!("CARGO_PKG_VERSION"),
     });
 
-    // Rime 数据目录由 libximecore 解析默认双目录（只读 shared + 用户 user）。
-    let _ = xime_setup_lib::set_rime_paths(xime_setup_lib::default_rime_paths());
+    // 单目录模型（对齐 daemon）：shared == user == ~/.config/xime/rime；
+    // 随包方案数据在启动时部署进 rime 目录（与 daemon 同一套 ensure 逻辑，
+    // 两端看到同一份方案来源）。
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let rime_dir = std::path::PathBuf::from(&home).join(".config/xime/rime");
+    let bundled_sources = [
+        std::path::PathBuf::from(&home).join(".local/share/xime/rime-data"),
+        std::path::PathBuf::from("/usr/share/xime/rime-data"),
+    ];
+    xime_setup_lib::ensure_bundled_rime_data(&bundled_sources, &rime_dir);
+    let _ = xime_setup_lib::set_rime_paths(xime_setup_lib::RimePaths {
+        shared_data_dir: rime_dir.clone(),
+        user_data_dir: rime_dir,
+    });
 
     xime_setup_lib::run()
 }

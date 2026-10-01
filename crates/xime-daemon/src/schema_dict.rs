@@ -268,22 +268,13 @@ fn stamp_of(path: &Path) -> FileStamp {
     Some((meta.len(), mtime))
 }
 
-/// 按目录顺序查找码表文件（XimeChe 双目录模型：user 优先，回退只读 shared）。
-/// 返回 (路径, 文本, 签名)；都不存在返回 None。
-fn find_table(
-    rime_dirs: &[std::path::PathBuf],
-    name: &str,
-) -> Option<(std::path::PathBuf, String, FileStamp)> {
-    for dir in rime_dirs {
-        let path = dir.join(format!("{name}.dict.yaml"));
-        let Some(stamp) = stamp_of(&path) else {
-            continue;
-        };
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            return Some((path, text, Some(stamp)));
-        }
-    }
-    None
+/// 读码表文件（单目录模型，对齐 XimeYao：方案与用户数据同一目录）。
+/// 返回 (文本, 签名)；不存在返回 None。
+fn find_table(rime_dir: &std::path::Path, name: &str) -> Option<(String, FileStamp)> {
+    let path = rime_dir.join(format!("{name}.dict.yaml"));
+    let stamp = stamp_of(&path)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some((text, Some(stamp)))
 }
 
 /// 进程内单条缓存：一次已解析的方案词表 + 读过的文件签名。
@@ -300,14 +291,11 @@ struct SchemaDictCache {
 
 impl SchemaDictCache {
     /// 签名是否仍然成立（缺失的名字也必须仍然缺失）。
-    fn matches(&self, rime_dirs: &[std::path::PathBuf]) -> bool {
+    fn matches(&self, rime_dir: &std::path::Path) -> bool {
         self.stamps.iter().all(|(name, stamp)| {
             // find_table 的 Option 是"找到与否"，内层 FileStamp 才是签名
             //（None = 此前缺失，现在也必须缺失）。
-            find_table(rime_dirs, name)
-                .map(|(_, _, s)| s)
-                .unwrap_or(None)
-                == *stamp
+            find_table(rime_dir, name).map(|(_, s)| s).unwrap_or(None) == *stamp
         })
     }
 }
@@ -317,11 +305,10 @@ static CACHE: Mutex<Option<SchemaDictCache>> = Mutex::new(None);
 
 /// 读取某方案的词表词条，按关键词过滤并截断。
 ///
-/// `rime_dirs` 按优先级排列（user 在前、shared 在后）。只读；主码表文件缺失/
-/// 读不出才是 `Err`（import_tables/packs 缺的文件记进 `missing`）。缓存签名
-/// 对不上就完整重读。
+/// 只读；主码表文件缺失/读不出才是 `Err`（import_tables/packs 缺的文件记进
+/// `missing`）。缓存签名对不上就完整重读。
 pub fn read_schema_dict(
-    rime_dirs: &[std::path::PathBuf],
+    rime_dir: &std::path::Path,
     schema_id: &str,
     query: &str,
 ) -> Result<SchemaDictRead, String> {
@@ -330,9 +317,7 @@ pub fn read_schema_dict(
         return Err("方案 id 为空，无法读取方案词表".to_string());
     }
 
-    let schema_text = rime_dirs
-        .iter()
-        .find_map(|dir| std::fs::read_to_string(dir.join(format!("{schema_id}.schema.yaml"))).ok())
+    let schema_text = std::fs::read_to_string(rime_dir.join(format!("{schema_id}.schema.yaml")))
         .unwrap_or_default();
     let dict_name = resolve_dict_name(&schema_text, schema_id);
     let packs = parse_packs(&schema_text);
@@ -343,7 +328,7 @@ pub fn read_schema_dict(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = cache.as_ref() {
-            if cached.dict_name == dict_name && cached.packs == packs && cached.matches(rime_dirs) {
+            if cached.dict_name == dict_name && cached.packs == packs && cached.matches(rime_dir) {
                 let rows: Vec<DictEntryRow> = cached
                     .entries
                     .iter()
@@ -368,8 +353,8 @@ pub fn read_schema_dict(
     // 冷读：顺手记录每个文件签名（含缺失的，用 None 表示）。
     let mut stamps: Vec<(String, FileStamp)> = Vec::new();
     let traversal = traverse(&dict_name, &packs, |name| {
-        match find_table(rime_dirs, name) {
-            Some((_, text, stamp)) => {
+        match find_table(rime_dir, name) {
+            Some((text, stamp)) => {
                 stamps.push((name.to_string(), stamp));
                 Some(text)
             }
@@ -514,7 +499,7 @@ name: wubi86\nversion: \"1\"\nsort: original\nimport_tables:\n  - wubi86_extra\n
         }
         std::fs::write(dir.path().join("small.dict.yaml"), text).unwrap();
 
-        let read = read_schema_dict(&[dir.path().to_path_buf()], "small", "").unwrap();
+        let read = read_schema_dict(dir.path(), "small", "").unwrap();
         assert_eq!(read.dict_name, "small");
         assert_eq!(read.tables, vec!["small"]);
         assert_eq!(read.missing, vec!["gone", "absent"]); // packs 先入队
@@ -523,7 +508,7 @@ name: wubi86\nversion: \"1\"\nsort: original\nimport_tables:\n  - wubi86_extra\n
         assert_eq!(read.entries.len(), DICT_ENTRIES_MAX);
 
         // 缓存命中 + 关键词过滤（code599 只命中 1 条）。
-        let filtered = read_schema_dict(&[dir.path().to_path_buf()], "small", "code599").unwrap();
+        let filtered = read_schema_dict(dir.path(), "small", "code599").unwrap();
         assert_eq!(filtered.total, 600);
         assert_eq!(filtered.matched, 1);
         assert_eq!(filtered.entries.len(), 1);

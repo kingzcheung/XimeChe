@@ -21,7 +21,7 @@ pub const MAX_CLIPBOARD_ITEMS: i64 = 1000;
 /// 快捷发送条目上限（Android: `MAX_QUICK_SEND_ITEMS = 20`）。
 pub const MAX_QUICK_SEND_ITEMS: i64 = 20;
 /// Android 数据库当前版本（v3：已含 `consumed`、`code` 两列）。
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// 项目全局存储单例（输入法进程内唯一）。
 static STORE: OnceLock<Arc<ClipboardStore>> = OnceLock::new();
@@ -386,7 +386,9 @@ fn trim_quick_send(tx: &Transaction) -> rusqlite::Result<()> {
 ///
 /// - v0（新库）：按 v1 结构建表 + text 索引，随后走 v2/v3 迁移补列；
 /// - v1→v2：`consumed` 列（Android MIGRATION_1_2）；
-/// - v2→v3：`code` 列（Android MIGRATION_2_3）。
+/// - v2→v3：`code` 列（Android MIGRATION_2_3）；
+/// - v3→v4：图片/类型列 + imageHash 索引（Android MIGRATION_3_4；列先备着，
+///   本端图片捕获功能未做，结构体暂不加字段）。
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 0 {
@@ -412,6 +414,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "ALTER TABLE clipboard_entries
              ADD COLUMN code TEXT NOT NULL DEFAULT ''",
+        )?;
+    }
+    if version < 4 {
+        // 对齐 Android MIGRATION_3_4 / libximecore clipboard_store v4 建表：
+        // 列名与默认值逐列一致，三端 DB 可互换。
+        conn.execute_batch(
+            "ALTER TABLE clipboard_entries ADD COLUMN type TEXT NOT NULL DEFAULT 'text';
+             ALTER TABLE clipboard_entries ADD COLUMN imagePath TEXT NOT NULL DEFAULT '';
+             ALTER TABLE clipboard_entries ADD COLUMN imageHash TEXT NOT NULL DEFAULT '';
+             ALTER TABLE clipboard_entries ADD COLUMN mimeType TEXT NOT NULL DEFAULT '';
+             ALTER TABLE clipboard_entries ADD COLUMN sizeBytes INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE clipboard_entries ADD COLUMN width INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE clipboard_entries ADD COLUMN height INTEGER NOT NULL DEFAULT 0;
+             CREATE INDEX IF NOT EXISTS index_clipboard_entries_imageHash
+                 ON clipboard_entries(imageHash);",
         )?;
     }
     if version != SCHEMA_VERSION {
@@ -443,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_v3_schema() {
+    fn open_creates_v4_schema() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_in(dir.path());
         let conn = store.conn.lock().unwrap();
@@ -463,6 +480,14 @@ mod tests {
             "isPinned",
             "isQuickSend",
             "consumed",
+            // Android v4：图片/类型列（本端暂无图片捕获功能，列先对齐）
+            "type",
+            "imagePath",
+            "imageHash",
+            "mimeType",
+            "sizeBytes",
+            "width",
+            "height",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -511,7 +536,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         // 老数据还在且新默认列生效
         let item: ClipboardEntry = conn
             .query_row(
@@ -545,6 +570,74 @@ mod tests {
         let conn = store.conn.lock().unwrap();
         assert!(column_names(&conn).contains("code"));
         drop(conn);
+    }
+
+    #[test]
+    fn migrate_v3_to_v4_and_preserve_data() {
+        // 手工构造 Android v3 库（含一条老数据）
+        let dir = tempfile::tempdir().unwrap();
+        let v3_path = dir.path().join("clipboard_v3.db");
+        {
+            let conn = Connection::open(&v3_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clipboard_entries (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    text        TEXT NOT NULL,
+                    code        TEXT NOT NULL DEFAULT '',
+                    timestamp   INTEGER NOT NULL DEFAULT 0,
+                    isPinned    INTEGER NOT NULL DEFAULT 0,
+                    isQuickSend INTEGER NOT NULL DEFAULT 0,
+                    consumed    INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO clipboard_entries (text, code, timestamp)
+                    VALUES ('老词条', 'laoci', 123);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+        let store = ClipboardStore::open(&v3_path).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let cols = column_names(&conn);
+        for col in [
+            "type",
+            "imagePath",
+            "imageHash",
+            "mimeType",
+            "sizeBytes",
+            "width",
+            "height",
+        ] {
+            assert!(cols.contains(col), "v3 -> v4 缺少列 {col}");
+        }
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        // imageHash 索引已建
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name = 'index_clipboard_entries_imageHash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+        // 老数据保留，读路径（row_to_entry 取前 7 列）不受新列影响
+        let item: ClipboardEntry = conn
+            .query_row(
+                "SELECT id, text, code, timestamp, isPinned, isQuickSend, consumed
+                 FROM clipboard_entries WHERE text = '老词条'",
+                [],
+                row_to_entry,
+            )
+            .unwrap();
+        assert_eq!(item.code, "laoci");
+        drop(conn);
+
+        // 新写入照常工作
+        store.upsert_and_trim("新词条", 456).unwrap();
+        assert_eq!(store.count_clipboard().unwrap(), 2);
     }
 
     #[test]

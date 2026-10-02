@@ -105,6 +105,28 @@ fn should_forward_key(
     !press_consumed && !release_of_consumed
 }
 
+/// 空格兜底判定（对齐 XimeYao）：组合态 + 无候选时，空格不上屏首选
+/// （没有首选可选）而应直接上屏编码本身。
+///
+/// 返回 Some(编码) = 拦截空格并上屏该文本；None = 交给 Rime 正常处理。
+/// 带 Ctrl/Alt/Shift/Super 的空格（启停 IM / 全半角切换 / 窗口快捷键）
+/// 一律不拦。
+fn space_fallback_input(
+    sym: u32,
+    modifiers: &ModifierState,
+    raw_input: Option<&str>,
+    num_candidates: usize,
+) -> Option<String> {
+    if sym != 0x20 || modifiers.ctrl || modifiers.alt || modifiers.shift || modifiers.super_key {
+        return None;
+    }
+    let input = raw_input?;
+    if input.is_empty() || num_candidates > 0 {
+        return None;
+    }
+    Some(input.to_string())
+}
+
 /// 最近一次候选窗内容（菜单开/关后重绘用，主题以当前值为准）。
 type CandidateCache = (Vec<xime_ui::CandidateItem>, usize);
 
@@ -676,6 +698,24 @@ impl WaylandLoop {
                 modifiers.effective as i32 | release_mask as i32,
             );
             debug!("Rime result: {:?}", result);
+
+            // 空格兜底：Rime 处理后组合仍在且无候选（confirm 落空/未消费），
+            // 直接上屏编码，保证空格始终有产出（对齐 XimeYao）。
+            let raw_input = session.get_input().map(str::to_string);
+            let num_candidates = session.context().map_or(0, |ctx| ctx.menu().num_candidates);
+            if let Some(raw) =
+                space_fallback_input(sym.raw(), &modifiers, raw_input.as_deref(), num_candidates)
+            {
+                c.commit_string(&raw);
+                let _ = c.flush();
+                plugin_host.emit_text_committed(&raw);
+                session.clear_composition();
+                c.clear_preedit();
+                let _ = c.flush();
+                consumed_presses.insert(event.key);
+                debug!("Space with no candidates: committed raw input '{raw}'");
+                return;
+            }
 
             if result && event.pressed {
                 let letter = keysym_to_letter(sym.raw());
@@ -1461,6 +1501,32 @@ async fn notify_desktop(summary: &str, body: &str) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_space_fallback_input() {
+        let none = ModifierState::default();
+        // 组合态 + 无候选：空格上屏编码
+        assert_eq!(
+            space_fallback_input(0x20, &none, Some("wubi"), 0),
+            Some("wubi".into())
+        );
+        // 有候选：交给 Rime confirm 首选
+        assert_eq!(space_fallback_input(0x20, &none, Some("wubi"), 3), None);
+        // 无组合：正常空格
+        assert_eq!(space_fallback_input(0x20, &none, None, 0), None);
+        assert_eq!(space_fallback_input(0x20, &none, Some(""), 0), None);
+        // 带修饰键：不拦（Ctrl+Space 启停 / Shift+Space 全半角）
+        let with_shift = ModifierState {
+            shift: true,
+            ..ModifierState::default()
+        };
+        assert_eq!(
+            space_fallback_input(0x20, &with_shift, Some("wubi"), 0),
+            None
+        );
+        // 非空格键不拦
+        assert_eq!(space_fallback_input(0xFF0D, &none, Some("wubi"), 0), None);
+    }
 
     #[test]
     fn test_should_forward_key_empty() {

@@ -1016,6 +1016,17 @@ impl WaylandConnectionV2 {
     }
 
     fn create_anonymous_file(size: u32) -> Result<OwnedFd> {
+        // memfd：纯匿名内存，不落文件系统（/tmp tmpfs 满时写页会 SIGBUS）。
+        if let Ok(fd) = nix::sys::memfd::memfd_create(
+            c"xime-shm",
+            nix::sys::memfd::MemFdCreateFlag::MFD_CLOEXEC,
+        ) {
+            let file = std::fs::File::from(fd);
+            file.set_len(size as u64)?;
+            return Ok(file.into());
+        }
+
+        // 回退：老内核无 memfd 时用 O_TMPFILE。
         let fd = nix::fcntl::open(
             &std::env::temp_dir(),
             nix::fcntl::OFlag::O_TMPFILE | nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_CLOEXEC,

@@ -478,6 +478,7 @@ impl WaylandLoop {
             self.handle_pointer_press(
                 c,
                 plugin_host,
+                rime,
                 panel,
                 panel_state,
                 last_panel_width,
@@ -1000,6 +1001,34 @@ impl WaylandLoop {
         self.redraw_menu_candidates(c, theme, candidate_window_visible);
     }
 
+    /// 面板选中上屏后的收尾（对齐 XimeYao：上屏走 commit 通道 →
+    /// composition 终止）：丢弃 Rime 里挂着的编码组合、收起面板、
+    /// **隐藏候选栏**——输入流程已结束，候选栏不再遮挡应用内容。
+    fn dismiss_panel_after_commit(
+        &self,
+        c: &mut dyn ImBackend,
+        rime: &mut RimeEngine,
+        panel: &mut PanelData,
+        panel_state: &mut PanelState,
+        candidate_window_visible: &mut bool,
+    ) {
+        if let Some(session) = rime.session() {
+            session.clear_composition();
+        }
+        c.clear_preedit();
+        *panel_state = PanelState::Closed;
+        *panel = PanelData::default();
+        c.hide_panel();
+        c.hide_candidate_window();
+        let _ = c.flush();
+        *candidate_window_visible = false;
+        // 清候选缓存：下次激活时从空组合开始，避免重绘出过期内容。
+        if let Ok(mut cache) = self.candidate_cache.lock() {
+            *cache = None;
+        }
+        debug!("Panel commit finished: composition cleared, candidate window hidden");
+    }
+
     /// 加载列表子页数据（剪切板 / 快捷发送）。
     fn load_panel_list(&self, page: PanelPage) -> PanelList {
         let items: Vec<PanelListItem> = match page {
@@ -1038,6 +1067,7 @@ impl WaylandLoop {
         &self,
         c: &mut dyn ImBackend,
         plugin_host: &mut PluginHost,
+        rime: &mut RimeEngine,
         panel: &mut PanelData,
         panel_state: &mut PanelState,
         last_panel_width: &u32,
@@ -1145,7 +1175,8 @@ impl WaylandLoop {
                 );
             }
             PanelHit::ListItem(row) => {
-                // 上屏后收起面板（XimeYao collapse_panel 语义）。
+                // 上屏即输入流程结束（对齐 XimeYao：上屏走 commit 通道，
+                // composition 随之终止 → 面板收起 + 候选栏隐藏 + 原编码丢弃）。
                 if let Some(item) = panel.list.item_at(row) {
                     let text = item.text.clone();
                     c.commit_string(&text);
@@ -1156,11 +1187,18 @@ impl WaylandLoop {
                         text.chars().count()
                     );
                     plugin_host.emit_text_committed(&text);
-                    self.close_panel(c, panel, panel_state, theme, candidate_window_visible);
+                    self.dismiss_panel_after_commit(
+                        c,
+                        rime,
+                        panel,
+                        panel_state,
+                        candidate_window_visible,
+                    );
                 }
             }
             PanelHit::GlyphCell(slot) => {
-                // 点字形 = 上屏，面板保持打开（可连续选择）；更新最近使用。
+                // 点字形 = 上屏，与列表条目同一收尾（XimeYao GlyphCell 分支
+                // 同样 collapse_panel；「最近使用」仍要记录）。
                 if let Some(glyph) = panel.grid.item_at(slot).map(str::to_string) {
                     c.commit_string(&glyph);
                     let _ = c.flush();
@@ -1172,9 +1210,13 @@ impl WaylandLoop {
                         crate::recent_usage::RecentKind::Symbol
                     };
                     crate::recent_usage::push(kind, &glyph);
-                    panel.grid.recent = crate::recent_usage::load(kind);
-                    Self::refresh_grid_cells(panel);
-                    self.show_panel_page(c, panel, page, theme, candidate_window_visible);
+                    self.dismiss_panel_after_commit(
+                        c,
+                        rime,
+                        panel,
+                        panel_state,
+                        candidate_window_visible,
+                    );
                 }
             }
             PanelHit::GlyphTab(tab) => {

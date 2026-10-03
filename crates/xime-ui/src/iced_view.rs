@@ -105,16 +105,13 @@ impl IcedSurface {
         self.renderer
             .draw(&mut pixmap_mut, &mut clip_mask, &viewport, &damage, bg);
 
-        // RGBA → BGRA 拷贝
+        // 直接按序拷贝：tiny-skia 的 pixmap 内存序是 BGRA（小端 u32
+        // 0xAABBGGRR），正好是 wl_shm ARGB8888 需要的字节序。
+        // 2026-10-03 事故：此处曾按 RGBA→BGRA 再交换一次，把整幅画面
+        // 的 R/B 翻反——文字黑白无感、主题色被配置掩盖，只有彩色 emoji
+        // 暴露（黄脸变蓝脸）。
         let data = pixmap.data();
-        for i in (0..data.len()).step_by(4) {
-            if i + 3 < pixels.len() {
-                pixels[i] = data[i + 2];
-                pixels[i + 1] = data[i + 1];
-                pixels[i + 2] = data[i];
-                pixels[i + 3] = data[i + 3];
-            }
-        }
+        pixels[..data.len()].copy_from_slice(data);
     }
 
     /// 测量 Element 自然尺寸（内容自适应宽度）。
@@ -473,8 +470,10 @@ fn build_panel_view<'a>(
         }
         Some(sub) => {
             // y：header → divider → Space → 网格 grid_top()..+GRID_HEIGHT →
-            // （Space → 翻页条 grid_footer_y()..）→ Space → 标签栏
-            // grid_tab_top()..（有翻页条时公式自动多一行）→ 底边距。
+            // Space → 翻页条 grid_footer_y()..（**布局恒定**：只要面板数据
+            // 需要翻页就常驻这一行——切到单页分类时不能省，否则标签栏上移
+            // 与命中公式错位；单页时 pager_bar 自己只画计数不画按钮，
+            // 对齐 XimeYao draw_footer）→ Space → 标签栏 → 底边距。
             let mut col = iced_widget::column![
                 bar,
                 page_header(sub, theme),
@@ -482,7 +481,7 @@ fn build_panel_view<'a>(
                 Space::new().height(gap_after_divider),
             ];
             col = col.push(grid_rows_page(grid, theme));
-            if grid.has_pager && grid.page_count() > 1 {
+            if grid.has_pager {
                 col = col.push(Space::new().height(PANEL_CONTENT_GAP));
                 col = col.push(pager_bar(
                     &format!("共 {} 个", grid.item_count),
@@ -798,9 +797,10 @@ fn pager_bar(
         btn.into()
     };
     // 结构（对齐 XimeYao 几何）：左 count 占满剩余宽，右端依次是
-    // 页码 label（72）→ 上一页 → 下一页；单页时不画页码。
-    let mut right = iced_widget::row![].spacing(PANEL_MENU_COL_GAP as f32);
+    // 页码 label（72）→ 上一页 → 下一页；**单页时整段右侧不画**
+    // （XimeYao draw_footer 的 pages > 1 分支），只留左侧计数。
     if total > 1 {
+        let mut right = iced_widget::row![].spacing(PANEL_MENU_COL_GAP as f32);
         right = right.push(
             container(
                 text(format!("第 {current}/{total} 页"))
@@ -810,18 +810,28 @@ fn pager_bar(
             .width(LIST_PAGE_LABEL_WIDTH)
             .align_x(iced_widget::core::alignment::Horizontal::Left),
         );
+        right = right.push(btn("上一页", has_prev));
+        right = right.push(btn("下一页", has_next));
+        return container(
+            row![
+                text(count_text.to_string())
+                    .size(small - 2.0)
+                    .color(theme.text_comment),
+                Space::new().width(iced_widget::core::Length::Fill),
+                right
+            ]
+            .align_y(iced_widget::core::alignment::Vertical::Center),
+        )
+        .width(iced_widget::core::Length::Fill)
+        .height(PANEL_ITEM_HEIGHT)
+        .padding([0, PANEL_H_INSET as u16])
+        .align_y(iced_widget::core::alignment::Vertical::Center)
+        .into();
     }
-    right = right.push(btn("上一页", has_prev));
-    right = right.push(btn("下一页", has_next));
     container(
-        row![
-            text(count_text.to_string())
-                .size(small - 2.0)
-                .color(theme.text_comment),
-            Space::new().width(iced_widget::core::Length::Fill),
-            right
-        ]
-        .align_y(iced_widget::core::alignment::Vertical::Center),
+        text(count_text.to_string())
+            .size(small - 2.0)
+            .color(theme.text_comment),
     )
     .width(iced_widget::core::Length::Fill)
     .height(PANEL_ITEM_HEIGHT)

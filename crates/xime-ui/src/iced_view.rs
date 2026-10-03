@@ -16,11 +16,11 @@ type Pixmap = tiny_skia11::Pixmap;
 type Mask = tiny_skia11::Mask;
 
 use crate::menu::{
-    list_row_y, truncate_text, PanelGrid, PanelList, PanelPage, GRID_CELL_GAP, GRID_CELL_HEIGHT,
-    GRID_PER_ROW, GRID_TAB_GAP, GRID_TAB_HEIGHT, LIST_DISPLAY_MAX_CHARS, LIST_PAGE_BUTTON_HEIGHT,
-    LIST_PAGE_BUTTON_WIDTH, LIST_ROWS_PER_PAGE, MENU_BUTTON_WIDTH, PANEL_BACK_HEIGHT,
-    PANEL_BACK_WIDTH, PANEL_HEADER_HEIGHT, PANEL_H_INSET, PANEL_ITEM_HEIGHT, PANEL_MENU_TOP,
-    PANEL_ROW_GAP,
+    list_row_y, PanelGrid, PanelList, PanelPage, EMPTY_TEXT, GRID_CELL_GAP, GRID_CELL_HEIGHT,
+    GRID_HEIGHT, GRID_PER_ROW, GRID_ROWS, GRID_TAB_GAP, GRID_TAB_HEIGHT, LIST_DISPLAY_MAX_CHARS,
+    LIST_PAGE_BUTTON_HEIGHT, LIST_PAGE_BUTTON_WIDTH, LIST_PAGE_LABEL_WIDTH, LIST_ROWS_PER_PAGE,
+    MENU_BUTTON_WIDTH, PANEL_HEADER_HEIGHT, PANEL_H_INSET, PANEL_ITEM_HEIGHT, PANEL_MENU_COL_GAP,
+    PANEL_MENU_TOP, PANEL_ROW_GAP, RECENT_EMPTY_TEXT,
 };
 use crate::theme::PanelTheme;
 use crate::CandidateItem;
@@ -435,17 +435,18 @@ fn build_panel_view<'a>(
     let content: Element<'a, (), Theme, Renderer> = match page {
         None => bar,
         Some(PanelPage::Menu) => {
-            let divider = panel_divider(theme);
-            iced_widget::column![bar, divider, menu_cards_page(theme), brand_footer(theme)].into()
+            // 菜单页无标题栏（对齐 XimeYao）：卡片直接跟在候选栏下，底部品牌条。
+            iced_widget::column![bar, menu_cards_page(theme), brand_footer(theme)].into()
         }
         Some(sub) if sub.is_list_page() => {
             let divider = panel_divider(theme);
             iced_widget::column![
                 bar,
-                divider,
                 page_header(sub, theme),
+                divider,
                 list_rows_page(sub, list, theme),
                 pager_bar(
+                    &format!("共 {} 条", list.items.len()),
                     list.clamped_page() + 1,
                     list.page_count(),
                     list.has_prev_page(),
@@ -457,10 +458,11 @@ fn build_panel_view<'a>(
         }
         Some(sub) => {
             let divider = panel_divider(theme);
-            let mut col = iced_widget::column![bar, divider, page_header(sub, theme)];
+            let mut col = iced_widget::column![bar, page_header(sub, theme), divider];
             col = col.push(grid_rows_page(grid, theme));
             if grid.has_pager && grid.page_count() > 1 {
                 col = col.push(pager_bar(
+                    &format!("共 {} 个", grid.item_count),
                     grid.clamped_page() + 1,
                     grid.page_count(),
                     grid.has_prev_page(),
@@ -493,41 +495,33 @@ fn neutral_row_bg(theme: &PanelTheme, alpha: f32) -> Color {
     )
 }
 
-/// 子页标题栏：「← 菜单」返回按钮（64x24 圆角灰底，几何见 panel_back_rect）+ 标题。
+/// 子页标题栏（对齐 XimeYao）：标题**粗体居中**，左侧「← 菜单」为纯次色文字
+/// （无底色），标题栏下一条 fg@6% 细分隔线（由 build_panel_view 排布）。
 fn page_header<'a>(page: PanelPage, theme: &'a PanelTheme) -> Element<'a, (), Theme, Renderer> {
-    let back_bg = neutral_row_bg(theme, 0.06);
-    let back = container(
-        text("← 菜单")
-            .size(theme.font_size)
-            .color(theme.text_comment),
-    )
-    .width(PANEL_BACK_WIDTH)
-    .height(PANEL_BACK_HEIGHT)
-    .align_x(iced_widget::core::alignment::Horizontal::Center)
-    .align_y(iced_widget::core::alignment::Vertical::Center)
-    .style(move |_| container::Style {
-        background: Some(iced_widget::core::Background::Color(back_bg)),
-        border: iced_widget::core::border::Border {
-            radius: iced_widget::core::border::Radius::from(6.0),
-            ..Default::default()
-        },
-        ..Default::default()
-    });
-    container(
-        row![
-            back,
-            text(page.title())
-                .size(theme.font_size + 1.0)
-                .color(theme.text_main)
-        ]
-        .spacing(10)
-        .align_y(iced_widget::core::alignment::Vertical::Center),
-    )
-    .width(iced_widget::core::Length::Fill)
-    .height(PANEL_HEADER_HEIGHT)
-    .padding([0, PANEL_H_INSET as u16])
-    .align_y(iced_widget::core::alignment::Vertical::Center)
-    .into()
+    let bold = Font {
+        weight: iced_widget::core::font::Weight::Bold,
+        ..Font::default()
+    };
+    let back = text("← 菜单")
+        .size(theme.font_size)
+        .color(theme.text_comment);
+    let title = text(page.title())
+        .size(theme.font_size + 1.0)
+        .font(bold)
+        .color(theme.text_main);
+    // 标题在整行居中；返回钮绝对定位在左（用三层叠放避免相互挤占）。
+    let title_layer = container(title)
+        .width(iced_widget::core::Length::Fill)
+        .height(PANEL_HEADER_HEIGHT)
+        .align_x(iced_widget::core::alignment::Horizontal::Center)
+        .align_y(iced_widget::core::alignment::Vertical::Center);
+    let back_layer = container(back)
+        .width(iced_widget::core::Length::Fill)
+        .height(PANEL_HEADER_HEIGHT)
+        .padding([0, PANEL_H_INSET as u16])
+        .align_x(iced_widget::core::alignment::Horizontal::Left)
+        .align_y(iced_widget::core::alignment::Vertical::Center);
+    iced_widget::stack![title_layer, back_layer].into()
 }
 
 /// 菜单页：2 列 × 3 行卡片（几何见 menu_card_rect，图标 + 文字）。
@@ -577,11 +571,16 @@ fn menu_card_cell(
         .position(|c| *c == card)
         .unwrap_or(0);
     let color = colors[idx];
-    let icon = container(text(card.icon().to_string()).size(theme.font_size + 2.0))
-        .width(24)
-        .height(24)
-        .align_x(iced_widget::core::alignment::Horizontal::Center)
-        .align_y(iced_widget::core::alignment::Vertical::Center);
+    let card_bg = neutral_row_bg(theme, 0.06);
+    let icon = container(
+        text(card.icon().to_string())
+            .size(theme.font_size + 2.0)
+            .color(color),
+    )
+    .width(24)
+    .height(24)
+    .align_x(iced_widget::core::alignment::Horizontal::Center)
+    .align_y(iced_widget::core::alignment::Vertical::Center);
     let item = row![
         icon,
         text(card.label().to_string())
@@ -597,12 +596,8 @@ fn menu_card_cell(
         .padding([0, 10])
         .align_y(iced_widget::core::alignment::Vertical::Center)
         .style(move |_| container::Style {
-            background: Some(iced_widget::core::Background::Color(Color::from_rgba8(
-                (color.r * 255.0) as u8,
-                (color.g * 255.0) as u8,
-                (color.b * 255.0) as u8,
-                0.08,
-            ))),
+            // 卡片底 = 前景 6%（对齐 XimeYao 的中性卡底，暗色主题自动适配）。
+            background: Some(iced_widget::core::Background::Color(card_bg)),
             border: iced_widget::core::border::Border {
                 radius: iced_widget::core::border::Radius::from(8.0),
                 ..Default::default()
@@ -612,11 +607,11 @@ fn menu_card_cell(
         .into()
 }
 
-/// 菜单页底部品牌条（XimeYao 的 footer 入口条位）。
+/// 菜单页底部品牌条（XimeYao 的 footer 入口条位；字号小一档）。
 fn brand_footer(theme: &PanelTheme) -> Element<'static, (), Theme, Renderer> {
     container(
         text("曦码·澈输入法")
-            .size(theme.font_size)
+            .size(theme.font_size - 2.0)
             .color(theme.text_comment),
     )
     .width(iced_widget::core::Length::Fill)
@@ -626,54 +621,102 @@ fn brand_footer(theme: &PanelTheme) -> Element<'static, (), Theme, Renderer> {
     .into()
 }
 
-/// 列表子页：6 行条目（全文截断 40 字 + 快捷发送编码列）+ 空态。
+/// 列表条目展示文本（对齐 XimeYao list_display_text）：控制字符折空格，
+/// 超长截断加省略号——面板单行显示，绝不折行。
+fn list_display_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut overflowed = false;
+    for (i, ch) in text.chars().enumerate() {
+        if i >= LIST_DISPLAY_MAX_CHARS {
+            overflowed = true;
+            break;
+        }
+        out.push(if ch.is_control() { ' ' } else { ch });
+    }
+    if overflowed {
+        out.push('…');
+    }
+    out
+}
+
+/// 列表子页（对齐 XimeYao）：6 行卡片式条目（圆角卡底、编码列在左、
+/// 正文左对齐单行）；空态主文案 + 补充提示整体居中于内容区。
 fn list_rows_page<'a>(
     page: PanelPage,
     list: &PanelList,
     theme: &'a PanelTheme,
 ) -> Element<'a, (), Theme, Renderer> {
     let small = theme.font_size;
+    // 行区高度 = 6 行总高（list_row_y 是面板内 y，含 header 偏移，需扣掉）。
+    let content_height = list_row_y(crate::menu::LIST_ROWS_PER_PAGE) - list_row_y(0);
     if list.items.is_empty() {
-        let mut col = iced_widget::column![text(page.list_empty_text())
-            .size(small)
-            .color(theme.text_comment),]
-        .spacing(6)
-        .align_x(iced_widget::core::alignment::Horizontal::Center);
+        let mut col = iced_widget::column![container(
+            text(page.list_empty_text())
+                .size(small)
+                .color(theme.text_comment)
+        )
+        .width(iced_widget::core::Length::Fill)
+        .align_x(iced_widget::core::alignment::Horizontal::Center),]
+        .spacing(4);
         if let Some(hint) = page.list_empty_hint() {
-            col = col.push(text(hint.to_string()).size(small).color(theme.text_comment));
+            col = col.push(
+                container(
+                    text(hint.to_string())
+                        .size(small - 2.0)
+                        .color(theme.text_comment),
+                )
+                .width(iced_widget::core::Length::Fill)
+                .align_x(iced_widget::core::alignment::Horizontal::Center),
+            );
         }
         return container(col)
             .width(iced_widget::core::Length::Fill)
-            .height(list_row_y(crate::menu::LIST_ROWS_PER_PAGE) - PANEL_HEADER_HEIGHT - 8)
+            .height(content_height)
             .align_y(iced_widget::core::alignment::Vertical::Center)
             .into();
     }
+    let card_bg = neutral_row_bg(theme, 0.06);
     let code_col = list.has_codes();
     let mut rows = iced_widget::column![].spacing(PANEL_ROW_GAP as f32);
     for i in 0..LIST_ROWS_PER_PAGE {
         let row_widget: Element<'static, (), Theme, Renderer> = match list.item_at(i) {
             Some(item) => {
-                let display = truncate_text(&item.text, LIST_DISPLAY_MAX_CHARS);
-                let main = text(display).size(small).color(theme.text_main);
-                let row_content = if code_col && !item.code.is_empty() {
+                // 编码列固定在正文左侧（对齐 XimeYao：左 8px 起、宽 64，正文右移）。
+                let content: Element<'static, (), Theme, Renderer> = if code_col {
                     row![
-                        main,
-                        Space::new().width(iced_widget::core::Length::Fill),
                         text(item.code.clone())
                             .size(small)
                             .color(theme.text_comment),
+                        text(list_display_text(&item.text))
+                            .size(small)
+                            .color(theme.text_main),
                     ]
-                    .align_y(iced_widget::core::alignment::Vertical::Center)
-                } else {
-                    row![main, Space::new().width(iced_widget::core::Length::Fill),]
-                        .align_y(iced_widget::core::alignment::Vertical::Center)
-                };
-                container(row_content)
-                    .width(iced_widget::core::Length::Fill)
-                    .height(PANEL_ITEM_HEIGHT)
-                    .padding([0, PANEL_H_INSET as u16])
+                    .spacing(crate::menu::QUICK_SEND_CODE_COL_GAP as f32)
                     .align_y(iced_widget::core::alignment::Vertical::Center)
                     .into()
+                } else {
+                    text(list_display_text(&item.text))
+                        .size(small)
+                        .color(theme.text_main)
+                        .into()
+                };
+                container(
+                    row![content, Space::new().width(iced_widget::core::Length::Fill)]
+                        .align_y(iced_widget::core::alignment::Vertical::Center),
+                )
+                .width(iced_widget::core::Length::Fill)
+                .height(PANEL_ITEM_HEIGHT)
+                .padding([0, 8])
+                .align_y(iced_widget::core::alignment::Vertical::Center)
+                .style(move |_| container::Style {
+                    background: Some(iced_widget::core::Background::Color(card_bg)),
+                    border: iced_widget::core::border::Border {
+                        radius: iced_widget::core::border::Radius::from(8.0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .into()
             }
             None => Space::new()
                 .width(iced_widget::core::Length::Fill)
@@ -683,13 +726,15 @@ fn list_rows_page<'a>(
         rows = rows.push(row_widget);
     }
     container(rows)
+        .padding([0, PANEL_H_INSET as u16])
         .width(iced_widget::core::Length::Fill)
-        .padding([0, 2])
         .into()
 }
 
-/// 底部翻页条（列表与网格共用几何：右对齐两颗 60x24 按钮 + 中间页码）。
+/// 底部翻页条（对齐 XimeYao）：左「共 N 条/个」、pages>1 时中「第 x/y 页」、
+/// 右侧上一页/下一页按钮（60x24 卡底；禁用不画底、文字次色）；按钮文字小一档。
 fn pager_bar(
+    count_text: &str,
     current: usize,
     total: usize,
     has_prev: bool,
@@ -697,48 +742,55 @@ fn pager_bar(
     theme: &PanelTheme,
 ) -> Element<'static, (), Theme, Renderer> {
     let small = theme.font_size;
+    let card_bg = neutral_row_bg(theme, 0.06);
     let btn = |label: &'static str, enabled: bool| -> Element<'static, (), Theme, Renderer> {
-        let bg = if enabled {
-            neutral_row_bg(theme, 0.08)
-        } else {
-            neutral_row_bg(theme, 0.03)
-        };
         let fg = if enabled {
             theme.text_main
         } else {
             theme.text_comment
         };
-        container(text(label.to_string()).size(small).color(fg))
+        let mut btn = container(text(label.to_string()).size(small - 2.0).color(fg))
             .width(LIST_PAGE_BUTTON_WIDTH)
             .height(LIST_PAGE_BUTTON_HEIGHT)
             .align_x(iced_widget::core::alignment::Horizontal::Center)
-            .align_y(iced_widget::core::alignment::Vertical::Center)
-            .style(move |_| container::Style {
-                background: Some(iced_widget::core::Background::Color(bg)),
+            .align_y(iced_widget::core::alignment::Vertical::Center);
+        if enabled {
+            btn = btn.style(move |_| container::Style {
+                background: Some(iced_widget::core::Background::Color(card_bg)),
                 border: iced_widget::core::border::Border {
-                    radius: iced_widget::core::border::Radius::from(6.0),
+                    radius: iced_widget::core::border::Radius::from(8.0),
                     ..Default::default()
                 },
                 ..Default::default()
-            })
-            .into()
+            });
+        }
+        btn.into()
     };
-    let pager = row![
-        btn("上一页", has_prev),
-        container(
-            text(format!("{current} / {total}"))
-                .size(small)
-                .color(theme.text_comment)
-        )
-        .width(72)
-        .align_x(iced_widget::core::alignment::Horizontal::Center),
-        btn("下一页", has_next),
-    ]
-    .spacing(8)
-    .align_y(iced_widget::core::alignment::Vertical::Center);
+    // 结构（对齐 XimeYao 几何）：左 count 占满剩余宽，右端依次是
+    // 页码 label（72）→ 上一页 → 下一页；单页时不画页码。
+    let mut right = iced_widget::row![].spacing(PANEL_MENU_COL_GAP as f32);
+    if total > 1 {
+        right = right.push(
+            container(
+                text(format!("第 {current}/{total} 页"))
+                    .size(small - 2.0)
+                    .color(theme.text_comment),
+            )
+            .width(LIST_PAGE_LABEL_WIDTH)
+            .align_x(iced_widget::core::alignment::Horizontal::Left),
+        );
+    }
+    right = right.push(btn("上一页", has_prev));
+    right = right.push(btn("下一页", has_next));
     container(
-        row![Space::new().width(iced_widget::core::Length::Fill), pager]
-            .align_y(iced_widget::core::alignment::Vertical::Center),
+        row![
+            text(count_text.to_string())
+                .size(small - 2.0)
+                .color(theme.text_comment),
+            Space::new().width(iced_widget::core::Length::Fill),
+            right
+        ]
+        .align_y(iced_widget::core::alignment::Vertical::Center),
     )
     .width(iced_widget::core::Length::Fill)
     .height(PANEL_ITEM_HEIGHT)
@@ -747,25 +799,57 @@ fn pager_bar(
     .into()
 }
 
-/// 网格子页：8 列网格铺满宽度（列宽 grid_cell_width），空槽留白。
+/// 网格子页（对齐 XimeYao）：8 列圆角卡片格子，表情字号 +4、符号 +2；
+/// 空槽不画；空标签在网格区中央给提示（暂无最近使用/暂无内容）。
 fn grid_rows_page(grid: &PanelGrid, theme: &PanelTheme) -> Element<'static, (), Theme, Renderer> {
-    // iced 离屏渲染的 buffer 宽度即面板宽度；这里用容器 Fill + 行内等分近似
-    // （列宽公式与命中同源：grid_cell_width），空槽不画内容。
+    let card_bg = neutral_row_bg(theme, 0.06);
+    let is_emoji = grid.source == PanelPage::Emoji;
+    let glyph_size = if is_emoji {
+        theme.font_size + 4.0
+    } else {
+        theme.font_size + 2.0
+    };
+    let items = grid.items_on_page();
+    if items == 0 {
+        let empty = if grid.tab == 0 {
+            RECENT_EMPTY_TEXT
+        } else {
+            EMPTY_TEXT
+        };
+        return container(
+            text(empty.to_string())
+                .size(theme.font_size - 2.0)
+                .color(theme.text_comment),
+        )
+        .width(iced_widget::core::Length::Fill)
+        .height(GRID_HEIGHT)
+        .align_x(iced_widget::core::alignment::Horizontal::Center)
+        .align_y(iced_widget::core::alignment::Vertical::Center)
+        .into();
+    }
     let mut col = iced_widget::column![].spacing(GRID_CELL_GAP as f32);
-    for r in 0..4usize {
+    for r in 0..GRID_ROWS {
         let mut row_widget = iced_widget::row![].spacing(GRID_CELL_GAP as f32);
         for c in 0..GRID_PER_ROW {
             let slot = r * GRID_PER_ROW + c;
             let cell: Element<'static, (), Theme, Renderer> = match grid.item_at(slot) {
                 Some(glyph) => container(
                     text(glyph.to_string())
-                        .size(theme.font_size + 3.0)
+                        .size(glyph_size)
                         .color(theme.text_main),
                 )
                 .width(iced_widget::core::Length::Fill)
                 .height(GRID_CELL_HEIGHT)
                 .align_x(iced_widget::core::alignment::Horizontal::Center)
                 .align_y(iced_widget::core::alignment::Vertical::Center)
+                .style(move |_| container::Style {
+                    background: Some(iced_widget::core::Background::Color(card_bg)),
+                    border: iced_widget::core::border::Border {
+                        radius: iced_widget::core::border::Radius::from(8.0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
                 .into(),
                 None => Space::new()
                     .width(iced_widget::core::Length::Fill)
@@ -799,6 +883,8 @@ fn tab_bar(grid: &PanelGrid, theme: &PanelTheme) -> Element<'static, (), Theme, 
             let i = r * crate::menu::GRID_TABS_PER_ROW + c;
             let cell: Element<'static, (), Theme, Renderer> = match grid.tabs.get(i) {
                 Some(label) => {
+                    // 对齐 XimeYao：选中 = 高亮底（主色 15%）+ 主文字色；
+                    // 其余 = 卡片底（fg 6%）+ 次文字色；字号小一档。
                     let active = i == current;
                     let (bg, fg) = if active {
                         (
@@ -806,20 +892,24 @@ fn tab_bar(grid: &PanelGrid, theme: &PanelTheme) -> Element<'static, (), Theme, 
                                 (theme.primary.r * 255.0) as u8,
                                 (theme.primary.g * 255.0) as u8,
                                 (theme.primary.b * 255.0) as u8,
-                                0.14,
+                                0.15,
                             ),
-                            theme.primary,
+                            theme.text_main,
                         )
                     } else {
-                        (neutral_row_bg(theme, 0.0), theme.text_comment)
+                        (neutral_row_bg(theme, 0.06), theme.text_comment)
                     };
-                    container(text(label.clone()).size(theme.font_size).color(fg))
+                    container(text(label.clone()).size(theme.font_size - 2.0).color(fg))
                         .width(iced_widget::core::Length::Fill)
                         .height(GRID_TAB_HEIGHT)
                         .align_x(iced_widget::core::alignment::Horizontal::Center)
                         .align_y(iced_widget::core::alignment::Vertical::Center)
                         .style(move |_| container::Style {
                             background: Some(iced_widget::core::Background::Color(bg)),
+                            border: iced_widget::core::border::Border {
+                                radius: iced_widget::core::border::Radius::from(8.0),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         })
                         .into()

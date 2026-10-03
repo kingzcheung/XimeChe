@@ -2,6 +2,7 @@ mod clipboard_sync;
 mod command;
 mod custom_phrase;
 mod daemon;
+mod emoji;
 mod plugin_host;
 mod recent_usage;
 mod rime;

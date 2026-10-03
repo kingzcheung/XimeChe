@@ -870,7 +870,7 @@ impl WaylandLoop {
     fn open_panel_page(
         &self,
         c: &mut dyn ImBackend,
-        plugin_host: &mut PluginHost,
+        _plugin_host: &mut PluginHost,
         panel: &mut PanelData,
         panel_state: &mut PanelState,
         page: PanelPage,
@@ -885,8 +885,16 @@ impl WaylandLoop {
             }
             PanelPage::QuickSend => panel.list = self.load_panel_list(page),
             PanelPage::Emoji => {
-                plugin_host.reload();
-                panel.grid_source = plugin_host.emoji_panel_data();
+                // 内置表情表（对齐 XimeYao：离线零配置，不依赖插件）。
+                panel.grid_source = crate::emoji::GROUPS
+                    .iter()
+                    .map(|g| {
+                        (
+                            g.category.to_string(),
+                            g.symbols.iter().map(|s| s.to_string()).collect(),
+                        )
+                    })
+                    .collect();
                 panel.grid.recent =
                     crate::recent_usage::load(crate::recent_usage::RecentKind::Emoji);
             }

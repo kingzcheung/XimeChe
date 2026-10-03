@@ -105,6 +105,8 @@ pub const GRID_CELL_WIDTH_MIN: u32 = 26;
 pub const RECENT_LABEL: &str = "最近";
 /// 「最近使用」为空时的提示。
 pub const RECENT_EMPTY_TEXT: &str = "暂无最近使用";
+/// 内置分类为空时的兜底提示（内置表有单测保证非空，这里只是绘制兜底）。
+pub const EMPTY_TEXT: &str = "暂无内容";
 /// 网格页网格区高度（4 行格子 + 行间距）。
 pub const GRID_HEIGHT: u32 = GRID_ROWS as u32 * (GRID_CELL_HEIGHT + GRID_CELL_GAP) - GRID_CELL_GAP;
 

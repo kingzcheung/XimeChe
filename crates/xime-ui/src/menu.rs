@@ -84,6 +84,11 @@ pub fn list_row_y(i: usize) -> u32 {
     PANEL_HEADER_HEIGHT + PANEL_CONTENT_GAP + i as u32 * (PANEL_ITEM_HEIGHT + PANEL_ROW_GAP)
 }
 
+/// 列表子页翻页条的 y（行区之下空一个内容间距；绘制与命中同源）。
+pub fn list_footer_y() -> u32 {
+    list_row_y(LIST_ROWS_PER_PAGE) - PANEL_ROW_GAP + PANEL_CONTENT_GAP
+}
+
 // ── 网格子页（表情 / 符号）──────────────────────────────────────
 
 /// 网格每行 8 格（安卓 `EmojiData.layoutColumns = 8`）。
@@ -691,6 +696,42 @@ pub fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 绘制堆叠必须与命中公式同源（2026-10-03 事故：iced 流式布局累积高度
+    /// 偏离命中公式 ~15px，表情/符号页标签全部点不中）。
+    #[test]
+    fn list_layout_stacking_matches_hit_geometry() {
+        // 绘制顺序：header → divider(1) → 空余间距(GAP-1) → 行区 → GAP → 翻页条。
+        // 行区 = 6 行 + 5 个行距（末行后没有行距，故扣回 ROW_GAP）。
+        let stacked = PANEL_HEADER_HEIGHT
+            + 1
+            + (PANEL_CONTENT_GAP - 1)
+            + (list_row_y(LIST_ROWS_PER_PAGE) - list_row_y(0) - PANEL_ROW_GAP)
+            + PANEL_CONTENT_GAP
+            + LIST_FOOTER_HEIGHT;
+        assert_eq!(
+            stacked + PANEL_BOTTOM_MARGIN,
+            list_panel_height(),
+            "列表页绘制堆叠高度必须等于命中公式的面板高度"
+        );
+    }
+
+    #[test]
+    fn grid_layout_stacking_matches_hit_geometry() {
+        for (tabs, has_pager) in [(2usize, false), (18usize, true)] {
+            let mut stacked =
+                PANEL_HEADER_HEIGHT + 1 + (PANEL_CONTENT_GAP - 1) + GRID_HEIGHT + PANEL_CONTENT_GAP;
+            if has_pager {
+                stacked += LIST_FOOTER_HEIGHT + PANEL_CONTENT_GAP;
+            }
+            stacked += grid_tab_height_total(tabs);
+            assert_eq!(
+                stacked + PANEL_BOTTOM_MARGIN,
+                grid_panel_height(tabs, has_pager),
+                "网格页 tabs={tabs} pager={has_pager} 堆叠高度偏离命中公式"
+            );
+        }
+    }
 
     #[test]
     fn menu_page_geometry_and_cards() {

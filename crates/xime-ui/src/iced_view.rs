@@ -19,8 +19,8 @@ use crate::menu::{
     list_row_y, PanelGrid, PanelList, PanelPage, EMPTY_TEXT, GRID_CELL_GAP, GRID_CELL_HEIGHT,
     GRID_HEIGHT, GRID_PER_ROW, GRID_ROWS, GRID_TAB_GAP, GRID_TAB_HEIGHT, LIST_DISPLAY_MAX_CHARS,
     LIST_PAGE_BUTTON_HEIGHT, LIST_PAGE_BUTTON_WIDTH, LIST_PAGE_LABEL_WIDTH, LIST_ROWS_PER_PAGE,
-    MENU_BUTTON_WIDTH, PANEL_HEADER_HEIGHT, PANEL_H_INSET, PANEL_ITEM_HEIGHT, PANEL_MENU_COL_GAP,
-    PANEL_MENU_TOP, PANEL_ROW_GAP, RECENT_EMPTY_TEXT,
+    MENU_BUTTON_WIDTH, PANEL_CONTENT_GAP, PANEL_HEADER_HEIGHT, PANEL_H_INSET, PANEL_ITEM_HEIGHT,
+    PANEL_MENU_COL_GAP, PANEL_MENU_TOP, PANEL_ROW_GAP, RECENT_EMPTY_TEXT,
 };
 use crate::theme::PanelTheme;
 use crate::CandidateItem;
@@ -431,20 +431,35 @@ fn build_panel_view<'a>(
     list: &PanelList,
     grid: &PanelGrid,
 ) -> Element<'a, (), Theme, Renderer> {
+    // 布局纪律（画得出来必须点得到）：子页各区块的纵向位置全部按
+    // menu.rs 的命中公式排布——header(36) → 分隔线(占内容间距首像素)
+    // → 空余间距 → 内容 → …，区块之间用显式 Space 补 PANEL_CONTENT_GAP，
+    // 不依赖 iced 流式布局的累积高度。
     let bar = candidate_bar(candidates, highlighted_index, theme);
+    let gap_after_divider = PANEL_CONTENT_GAP - 1;
     let content: Element<'a, (), Theme, Renderer> = match page {
         None => bar,
         Some(PanelPage::Menu) => {
-            // 菜单页无标题栏（对齐 XimeYao）：卡片直接跟在候选栏下，底部品牌条。
-            iced_widget::column![bar, menu_cards_page(theme), brand_footer(theme)].into()
+            // 菜单页（对齐 XimeYao）：无标题栏；卡片自 PANEL_MENU_TOP 起，
+            // 品牌条 = 卡片区 + 间距；总高与 menu_panel_height() 一致。
+            iced_widget::column![
+                bar,
+                menu_cards_page(theme),
+                Space::new().height(PANEL_CONTENT_GAP),
+                brand_footer(theme),
+            ]
+            .into()
         }
         Some(sub) if sub.is_list_page() => {
-            let divider = panel_divider(theme);
+            // y：header 0..36 → divider 36..37 → Space → 行区 44..256 →
+            // Space → 翻页条 list_footer_y()..+32 → 底边距。
             iced_widget::column![
                 bar,
                 page_header(sub, theme),
-                divider,
+                panel_divider(theme),
+                Space::new().height(gap_after_divider),
                 list_rows_page(sub, list, theme),
+                Space::new().height(PANEL_CONTENT_GAP),
                 pager_bar(
                     &format!("共 {} 条", list.items.len()),
                     list.clamped_page() + 1,
@@ -457,10 +472,18 @@ fn build_panel_view<'a>(
             .into()
         }
         Some(sub) => {
-            let divider = panel_divider(theme);
-            let mut col = iced_widget::column![bar, page_header(sub, theme), divider];
+            // y：header → divider → Space → 网格 grid_top()..+GRID_HEIGHT →
+            // （Space → 翻页条 grid_footer_y()..）→ Space → 标签栏
+            // grid_tab_top()..（有翻页条时公式自动多一行）→ 底边距。
+            let mut col = iced_widget::column![
+                bar,
+                page_header(sub, theme),
+                panel_divider(theme),
+                Space::new().height(gap_after_divider),
+            ];
             col = col.push(grid_rows_page(grid, theme));
             if grid.has_pager && grid.page_count() > 1 {
+                col = col.push(Space::new().height(PANEL_CONTENT_GAP));
                 col = col.push(pager_bar(
                     &format!("共 {} 个", grid.item_count),
                     grid.clamped_page() + 1,
@@ -470,6 +493,7 @@ fn build_panel_view<'a>(
                     theme,
                 ));
             }
+            col = col.push(Space::new().height(PANEL_CONTENT_GAP));
             col = col.push(tab_bar(grid, theme));
             col.into()
         }
@@ -495,32 +519,33 @@ fn neutral_row_bg(theme: &PanelTheme, alpha: f32) -> Color {
     )
 }
 
-/// 子页标题栏（对齐 XimeYao）：标题**粗体居中**，左侧「← 菜单」为纯次色文字
-/// （无底色），标题栏下一条 fg@6% 细分隔线（由 build_panel_view 排布）。
+/// 子页标题栏（对齐 XimeYao）：标题**粗体居中**，左侧「← 菜单」为纯次色文字。
+/// 标题栏下的分隔线由 build_panel_view 排布（占内容间距的首个 1px，总高不变）。
 fn page_header<'a>(page: PanelPage, theme: &'a PanelTheme) -> Element<'a, (), Theme, Renderer> {
     let bold = Font {
         weight: iced_widget::core::font::Weight::Bold,
         ..Font::default()
     };
-    let back = text("← 菜单")
-        .size(theme.font_size)
-        .color(theme.text_comment);
-    let title = text(page.title())
-        .size(theme.font_size + 1.0)
-        .font(bold)
-        .color(theme.text_main);
-    // 标题在整行居中；返回钮绝对定位在左（用三层叠放避免相互挤占）。
-    let title_layer = container(title)
-        .width(iced_widget::core::Length::Fill)
-        .height(PANEL_HEADER_HEIGHT)
-        .align_x(iced_widget::core::alignment::Horizontal::Center)
-        .align_y(iced_widget::core::alignment::Vertical::Center);
-    let back_layer = container(back)
-        .width(iced_widget::core::Length::Fill)
-        .height(PANEL_HEADER_HEIGHT)
-        .padding([0, PANEL_H_INSET as u16])
-        .align_x(iced_widget::core::alignment::Horizontal::Left)
-        .align_y(iced_widget::core::alignment::Vertical::Center);
+    let title_layer = container(
+        text(page.title())
+            .size(theme.font_size + 1.0)
+            .font(bold)
+            .color(theme.text_main),
+    )
+    .width(iced_widget::core::Length::Fill)
+    .height(PANEL_HEADER_HEIGHT)
+    .align_x(iced_widget::core::alignment::Horizontal::Center)
+    .align_y(iced_widget::core::alignment::Vertical::Center);
+    let back_layer = container(
+        text("← 菜单")
+            .size(theme.font_size)
+            .color(theme.text_comment),
+    )
+    .width(iced_widget::core::Length::Fill)
+    .height(PANEL_HEADER_HEIGHT)
+    .padding([0, PANEL_H_INSET as u16])
+    .align_x(iced_widget::core::alignment::Horizontal::Left)
+    .align_y(iced_widget::core::alignment::Vertical::Center);
     iced_widget::stack![title_layer, back_layer].into()
 }
 
@@ -528,7 +553,7 @@ fn page_header<'a>(page: PanelPage, theme: &'a PanelTheme) -> Element<'a, (), Th
 fn menu_cards_page(theme: &PanelTheme) -> Element<'static, (), Theme, Renderer> {
     let mut col = iced_widget::column![].spacing(PANEL_ROW_GAP as f32);
     for row_idx in 0..3usize {
-        let mut row_widget = iced_widget::row![].spacing(PANEL_MENU_TOP.min(8) as f32);
+        let mut row_widget = iced_widget::row![].spacing(PANEL_MENU_COL_GAP as f32);
         for col_idx in 0..2usize {
             let index = row_idx * 2 + col_idx;
             let cell: Element<'static, (), Theme, Renderer> = match crate::menu::MenuCard::at(index)
@@ -647,8 +672,10 @@ fn list_rows_page<'a>(
     theme: &'a PanelTheme,
 ) -> Element<'a, (), Theme, Renderer> {
     let small = theme.font_size;
-    // 行区高度 = 6 行总高（list_row_y 是面板内 y，含 header 偏移，需扣掉）。
-    let content_height = list_row_y(crate::menu::LIST_ROWS_PER_PAGE) - list_row_y(0);
+    // 行区高度 = 6 行 + 5 个行距（末行后没有行距；list_row_y 是面板内 y，
+    // 含 header 偏移，需扣掉）。
+    let content_height =
+        list_row_y(crate::menu::LIST_ROWS_PER_PAGE) - list_row_y(0) - PANEL_ROW_GAP;
     if list.items.is_empty() {
         let mut col = iced_widget::column![container(
             text(page.list_empty_text())
@@ -681,12 +708,16 @@ fn list_rows_page<'a>(
     for i in 0..LIST_ROWS_PER_PAGE {
         let row_widget: Element<'static, (), Theme, Renderer> = match list.item_at(i) {
             Some(item) => {
-                // 编码列固定在正文左侧（对齐 XimeYao：左 8px 起、宽 64，正文右移）。
+                // 编码列固定在正文左侧（对齐 XimeYao：左 8px 起、定宽 64，
+                // 翻页时正文起点不随编码长度跳动）。
                 let content: Element<'static, (), Theme, Renderer> = if code_col {
                     row![
-                        text(item.code.clone())
-                            .size(small)
-                            .color(theme.text_comment),
+                        container(
+                            text(item.code.clone())
+                                .size(small)
+                                .color(theme.text_comment)
+                        )
+                        .width(crate::menu::QUICK_SEND_CODE_COL_WIDTH),
                         text(list_display_text(&item.text))
                             .size(small)
                             .color(theme.text_main),
@@ -929,13 +960,14 @@ fn tab_bar(grid: &PanelGrid, theme: &PanelTheme) -> Element<'static, (), Theme, 
         .into()
 }
 
-/// 面板区与候选栏之间的分隔线。
+/// 标题栏底部分隔线（fg@6%，对齐 XimeYao 的 line_brush）。
 fn panel_divider<'a>(theme: &'a PanelTheme) -> Element<'a, (), Theme, Renderer> {
+    let line_bg = neutral_row_bg(theme, 0.06);
     container(Space::new())
         .width(iced_widget::core::Length::Fill)
         .height(1)
         .style(move |_| container::Style {
-            background: Some(iced_widget::core::Background::Color(theme.border)),
+            background: Some(iced_widget::core::Background::Color(line_bg)),
             ..Default::default()
         })
         .into()

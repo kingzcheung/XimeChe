@@ -33,8 +33,14 @@ fn main() {
     let list = PanelList {
         source: PanelPage::QuickSend,
         items: vec![
-            PanelListItem { text: "你好，在吗？".into(), code: "nhzm".into() },
-            PanelListItem { text: "收到，马上处理。".into(), code: "sdmscl".into() },
+            PanelListItem {
+                text: "你好，在吗？".into(),
+                code: "nhzm".into(),
+            },
+            PanelListItem {
+                text: "收到，马上处理。".into(),
+                code: "sdmscl".into(),
+            },
         ],
         page: 0,
     };

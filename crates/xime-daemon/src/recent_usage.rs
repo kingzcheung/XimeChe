@@ -29,6 +29,20 @@ impl RecentKind {
     }
 }
 
+/// 测试走 temp 目录（进程级唯一文件），绝不写真实用户文件。
+///
+/// 2026-10-03 事故：测试直接读写 `~/.config/xime/recent_usage.json`，
+/// 把实机用户的「最近使用」覆盖成了测试数据（e8~e39）——用户在表情页
+/// 「最近」标签看到一格格的 e20/e39。教训：测试与用户数据的路径必须隔离。
+#[cfg(test)]
+fn store_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "xime-recent-usage-test-{}.json",
+        std::process::id()
+    ))
+}
+
+#[cfg(not(test))]
 fn store_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     PathBuf::from(home)

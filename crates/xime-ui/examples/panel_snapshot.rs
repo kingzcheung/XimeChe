@@ -14,7 +14,10 @@ fn main() {
     let mut surface = IcedSurface::new();
 
     // 1. 菜单页
-    let (w, h) = (400u32, theme.bar_height() + menu_panel_height());
+    let (w, h) = (
+        400u32,
+        theme.bar_height() + xime_ui::menu::PANEL_GAP + menu_panel_height(),
+    );
     let mut px = vec![0u8; (w * h * 4) as usize];
     surface.draw_panel(
         &mut px,
@@ -44,7 +47,10 @@ fn main() {
         ],
         page: 0,
     };
-    let (w2, h2) = (400u32, theme.bar_height() + list_panel_height());
+    let (w2, h2) = (
+        400u32,
+        theme.bar_height() + xime_ui::menu::PANEL_GAP + list_panel_height(),
+    );
     let mut px2 = vec![0u8; (w2 * h2 * 4) as usize];
     surface.draw_panel(
         &mut px2,
@@ -75,7 +81,10 @@ fn main() {
         tabs: vec!["最近".into(), "常用".into()],
         has_pager: false,
     };
-    let (w3, h3) = (400u32, theme.bar_height() + grid_panel_height(2, false));
+    let (w3, h3) = (
+        400u32,
+        theme.bar_height() + xime_ui::menu::PANEL_GAP + grid_panel_height(2, false),
+    );
     let mut px3 = vec![0u8; (w3 * h3 * 4) as usize];
     surface.draw_panel(
         &mut px3,

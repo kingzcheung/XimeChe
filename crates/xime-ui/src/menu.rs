@@ -51,6 +51,13 @@ pub const PANEL_BACK_WIDTH: u32 = 64;
 pub const PANEL_BACK_HEIGHT: u32 = 24;
 /// 菜单页顶部留白（菜单页无标题栏，内容直接从顶部开始）。
 pub const PANEL_MENU_TOP: u32 = 10;
+/// 面板区与候选栏之间的间距（对齐 XimeYao PANEL_GAP：候选栏之下先空 4px，
+/// 面板底色块才起画；命中坐标系同步下移，见 daemon 的指针事件换算）。
+pub const PANEL_GAP: u32 = 4;
+/// 面板底色（对齐 XimeYao 硬编码的浅灰 (0.92,0.92,0.94)@0.96；
+/// 暗色主题用对应深灰，保持同样的层级感）。
+pub const PANEL_SURFACE_BG_LIGHT: [u8; 3] = [235, 235, 240];
+pub const PANEL_SURFACE_BG_DARK: [u8; 3] = [38, 38, 42];
 
 // ── 列表子页（剪切板 / 快捷发送）────────────────────────────────
 

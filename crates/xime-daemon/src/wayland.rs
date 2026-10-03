@@ -1074,12 +1074,18 @@ impl WaylandLoop {
             return;
         }
 
+        // 面板区与候选栏之间的 PANEL_GAP 缝隙：无交互。
+        let gap_bottom = bar + xime_ui::menu::PANEL_GAP;
+        if pe.y < gap_bottom as i32 {
+            return;
+        }
+
         let page = match panel_state {
             PanelState::Open(page) => *page,
             PanelState::Closed => return,
         };
-        // 面板内坐标（扣除候选栏高度）。
-        let (px, py) = (pe.x.max(0) as u32, (pe.y - bar as i32).max(0) as u32);
+        // 面板内坐标（扣除候选栏高度 + PANEL_GAP，与绘制同源）。
+        let (px, py) = (pe.x.max(0) as u32, (pe.y - gap_bottom as i32).max(0) as u32);
         let Some(hit) = xime_ui::panel_hit(page, width, &panel.list, &panel.grid, px, py) else {
             // 面板空白点击：不动作（对齐 XimeYao，不误关）。
             return;

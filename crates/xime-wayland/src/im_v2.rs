@@ -789,7 +789,14 @@ impl WaylandConnectionV2 {
             }
             None => 0,
         };
-        let height = theme.bar_height() + panel_height;
+        // 面板区与候选栏之间有 PANEL_GAP（对齐 XimeYao）：面板展开时
+        // buffer 高度多出这 4px 缝隙，命中换算同步（daemon 指针事件）。
+        let height = theme.bar_height()
+            + if panel_height > 0 {
+                xime_ui::menu::PANEL_GAP + panel_height
+            } else {
+                0
+            };
 
         // Take surface out of self for width measurement and drawing
         let mut surface = self.renderer.take().unwrap_or_default();

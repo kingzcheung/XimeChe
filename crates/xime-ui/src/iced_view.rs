@@ -19,8 +19,8 @@ use crate::menu::{
     list_row_y, PanelGrid, PanelList, PanelPage, EMPTY_TEXT, GRID_CELL_GAP, GRID_CELL_HEIGHT,
     GRID_HEIGHT, GRID_PER_ROW, GRID_ROWS, GRID_TAB_GAP, GRID_TAB_HEIGHT, LIST_DISPLAY_MAX_CHARS,
     LIST_PAGE_BUTTON_HEIGHT, LIST_PAGE_BUTTON_WIDTH, LIST_PAGE_LABEL_WIDTH, LIST_ROWS_PER_PAGE,
-    MENU_BUTTON_WIDTH, PANEL_CONTENT_GAP, PANEL_HEADER_HEIGHT, PANEL_H_INSET, PANEL_ITEM_HEIGHT,
-    PANEL_MENU_COL_GAP, PANEL_MENU_TOP, PANEL_ROW_GAP, RECENT_EMPTY_TEXT,
+    MENU_BUTTON_WIDTH, PANEL_CONTENT_GAP, PANEL_GAP, PANEL_HEADER_HEIGHT, PANEL_H_INSET,
+    PANEL_ITEM_HEIGHT, PANEL_MENU_COL_GAP, PANEL_MENU_TOP, PANEL_ROW_GAP, RECENT_EMPTY_TEXT,
 };
 use crate::theme::PanelTheme;
 use crate::CandidateItem;
@@ -181,6 +181,13 @@ impl IcedSurface {
             theme.bg,
         );
 
+        // 1.5 面板区底色（对齐 XimeYao：候选栏之下空 PANEL_GAP，面板块用
+        // 独立于候选栏主题的浅灰底，底部两角随面板圆角收口）。
+        if page.is_some() {
+            let panel_top = theme.bar_height() + PANEL_GAP;
+            paint_panel_surface(pixels, width, height, panel_top, theme);
+        }
+
         // 2. iced 渲染内容（透明背景）到临时 buffer
         let mut content = vec![0u8; (width * height * 4) as usize];
         let mut view = build_panel_view(candidates, highlighted_index, theme, page, list, grid);
@@ -249,6 +256,51 @@ fn rounded_rect_sdf(x: f32, y: f32, w: f32, h: f32, r: f32, px: f32, py: f32) ->
 /// 圆角矩形抗锯齿覆盖因子（0..=1）。
 fn rounded_alpha(sdf: f32) -> f32 {
     (0.5 - sdf).clamp(0.0, 1.0)
+}
+
+/// 面板区底色（亮/暗；对齐 XimeYao 硬编码浅灰，暗色用等价深灰）。
+fn panel_surface_color(theme: &PanelTheme) -> Color {
+    let [r, g, b] = if theme.dark {
+        crate::menu::PANEL_SURFACE_BG_DARK
+    } else {
+        crate::menu::PANEL_SURFACE_BG_LIGHT
+    };
+    Color::from_rgb8(r, g, b)
+}
+
+/// 在 buffer 下部画面板区底色块（对齐 XimeYao：独立圆角卡片，四角
+/// 圆角 = corner_radius，与候选栏之间由 PANEL_GAP 露出底色缝隙）。
+fn paint_panel_surface(pixels: &mut [u8], width: u32, height: u32, top: u32, theme: &PanelTheme) {
+    let (fw, fh) = (width as f32, (height - top) as f32);
+    let radius = theme.corner_radius;
+    let (cr, cg, cb) = {
+        let c = panel_surface_color(theme);
+        (c.r * 255.0, c.g * 255.0, c.b * 255.0)
+    };
+    let w = width as usize;
+    for y in top as usize..height as usize {
+        for x in 0..w {
+            let d = rounded_rect_sdf(
+                0.0,
+                0.0,
+                fw,
+                fh,
+                radius,
+                x as f32 + 0.5,
+                (y - top as usize) as f32 + 0.5,
+            );
+            let a = rounded_alpha(d);
+            if a <= 0.0 {
+                continue;
+            }
+            let idx = (y * w + x) * 4;
+            let inv = 1.0 - a;
+            pixels[idx] = (cb * a + pixels[idx] as f32 * inv) as u8;
+            pixels[idx + 1] = (cg * a + pixels[idx + 1] as f32 * inv) as u8;
+            pixels[idx + 2] = (cr * a + pixels[idx + 2] as f32 * inv) as u8;
+            pixels[idx + 3] = 255;
+        }
+    }
 }
 
 /// 在 BGRA buffer 上绘制圆角矩形背景 + 边框（SDF 精确，绕开 tiny-skia 曲线偏差）。
@@ -441,6 +493,7 @@ fn build_panel_view<'a>(
             // 品牌条 = 卡片区 + 间距；总高与 menu_panel_height() 一致。
             iced_widget::column![
                 bar,
+                Space::new().height(PANEL_GAP),
                 menu_cards_page(theme),
                 Space::new().height(PANEL_CONTENT_GAP),
                 brand_footer(theme),
@@ -452,6 +505,7 @@ fn build_panel_view<'a>(
             // Space → 翻页条 list_footer_y()..+32 → 底边距。
             iced_widget::column![
                 bar,
+                Space::new().height(PANEL_GAP),
                 page_header(sub, theme),
                 panel_divider(theme),
                 Space::new().height(gap_after_divider),
@@ -476,6 +530,7 @@ fn build_panel_view<'a>(
             // 对齐 XimeYao draw_footer）→ Space → 标签栏 → 底边距。
             let mut col = iced_widget::column![
                 bar,
+                Space::new().height(PANEL_GAP),
                 page_header(sub, theme),
                 panel_divider(theme),
                 Space::new().height(gap_after_divider),
@@ -506,11 +561,13 @@ fn build_panel_view<'a>(
         .into()
 }
 
-/// 中性行背景色（主题前景按 alpha 混入主题背景）。
+/// 中性行背景色（主题前景按 alpha 混入**面板底色**——卡片/格子都画在
+/// 面板块上，对齐 XimeYao 的 fg@0.06 混合基底）。
 fn neutral_row_bg(theme: &PanelTheme, alpha: f32) -> Color {
     let to8 = |c: f32| (c * 255.0).round() as u8;
     let blend = |fg: u8, bg: u8| (fg as f32 * alpha + bg as f32 * (1.0 - alpha)) as u8;
-    let (fg, bg) = (theme.text_main, theme.bg);
+    let surface = panel_surface_color(theme);
+    let (fg, bg) = (theme.text_main, surface);
     Color::from_rgb8(
         blend(to8(fg.r), to8(bg.r)),
         blend(to8(fg.g), to8(bg.g)),

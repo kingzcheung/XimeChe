@@ -1,22 +1,16 @@
 //! 符号面板的内置符号表（候选栏菜单「符号」入口）。
 //!
-//! 数据来自 Xime（Android 版）的 SymbolData.kt 符号表，按类别分组；
-//! 搜索时先按分组匹配（分类名/类别 id/关键词包含查询词），
-//! 未命中分组的符号再按字符包含匹配。
+//! 数据来自 Xime（Android 版）的 SymbolData.kt 符号表，按类别分组。
 
-use xime_plugin::EmojiItem;
-
-/// 一组符号：分类名 + 搜索关键词 + 符号列表。
+/// 一组符号：分类名 + 符号列表。
 pub struct SymbolGroup {
     pub category: &'static str,
-    pub keywords: &'static [&'static str],
     pub symbols: &'static [&'static str],
 }
 
 pub static GROUPS: &[SymbolGroup] = &[
     SymbolGroup {
         category: "中",
-        keywords: &["punctuationSymbols", "标点", "标号", "括号", "中"],
         symbols: &[
             "。", "，", "、", "：", "；", "‘", "’", "“", "”", "〝", "〞", "﹕", "︰", "﹔", "﹖",
             "﹑", "？", "！", "～", "—", "｜", "‖", "＂", "〃", "｀", "﹫", "﹏", "﹋", "︴", "々",
@@ -28,7 +22,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "英",
-        keywords: &["englishSymbols", "英文", "英语", "ascii", "英"],
         symbols: &[
             ".", ",", ";", ":", "!", "?", "'", "\"", "@", "#", "$", "%", "^", "&", "*", "-", "_",
             "=", "+", "~", "`", "|", "\\", "/", "(", ")", "[", "]", "{", "}", "<", ">", "·", "•",
@@ -39,14 +32,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "数",
-        keywords: &[
-            "mathematicalSymbols",
-            "数学",
-            "数学符号",
-            "math",
-            "运算",
-            "数",
-        ],
         symbols: &[
             "≥", "≮", "≠", "≢", "^", "∽", "≌", "≯", "≈", "＜", "＞", "≥", "≤", "⩾", "⩽", "⋘", "⋙",
             "=", "≈", "≝", "≞", "‖", "∠", "∡", "∢", "≡", "+", "-", "×", "÷", "＋", "－", "±", "/",
@@ -58,7 +43,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "⓵",
-        keywords: &["numericSymbols", "序号", "数字", "编号", "数字圈", "⓵"],
         symbols: &[
             "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩", "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰",
             "⑱", "⑲", "⑳", "⓵", "⓶", "⓷", "⓸", "⓹", "⓺", "⓻", "⓼", "⓽", "⓾", "⓿", "❶", "❷", "❸",
@@ -75,7 +59,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "Xⁿ",
-        keywords: &["superscriptSubscript", "上标", "下标", "次方", "平方", "Xⁿ"],
         symbols: &[
             "ⁿ", "ⁱ", "⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹", "⁺", "⁻", "⁼", "₊", "₋",
             "₌", "⁽", "⁾", "₍", "₎", "₀", "₁", "₂", "₃", "₄", "₅", "₆", "₇", "₈", "₉", "ₐ", "ₑ",
@@ -84,17 +67,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "◓",
-        keywords: &[
-            "graphicalSymbols",
-            "图形",
-            "几何",
-            "方块",
-            "圆圈",
-            "星",
-            "三角",
-            "特殊",
-            "◓",
-        ],
         symbols: &[
             "♕", "♖", "♔", "♗", "♘", "♙", "♛", "♜", "♚", "♝", "♞", "♟", "☼", "☀", "❣", "♺", "♻",
             "☢", "❡", "☁", "☂", "☔", "☃", "☽", "☾", "♨", "❄", "❅", "❆", "❖", "★", "☆", "✦", "✪",
@@ -119,7 +91,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "⇌",
-        keywords: &["arrowSymbols", "箭头", "方向", "arrow", "⇌"],
         symbols: &[
             "←", "↑", "→", "↓", "↙", "↘", "↖", "↗", "↰", "↱", "↲", "↳", "↴", "↵", "↶", "↺", "↻",
             "↷", "➝", "⇄", "⇅", "⇆", "⇇", "⇈", "⇉", "⇊", "⇋", "⇌", "⇍", "⇎", "⇏", "⇐", "⇑", "⇒",
@@ -133,17 +104,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "¥",
-        keywords: &[
-            "currencySymbols",
-            "货币",
-            "钱",
-            "美元",
-            "欧元",
-            "日元",
-            "英镑",
-            "currency",
-            "¥",
-        ],
         symbols: &[
             "$", "€", "ƒ", "£", "₤", "¥", "₵", "¢", "฿", "₮", "৲", "৳", "௹", "៛", "₠", "₡", "₢",
             "₣", "₥", "₦", "₧", "₨", "₩", "₪", "₫", "₭", "₯", "₰", "₱", "₲", "₳", "₴", "﷼", "¤",
@@ -151,7 +111,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "𝒲",
-        keywords: &["englishLetters", "花体", "黑体", "粗体", "字母", "𝒲"],
         symbols: &[
             "𝐚", "𝐛", "𝐜", "𝐝", "𝐞", "𝐟", "𝐠", "𝐡", "𝐢", "𝐣", "𝐤", "𝐥", "𝐦", "𝐧", "𝐨", "𝐩", "𝐪",
             "𝐫", "𝐬", "𝐭", "𝐮", "𝐯", "𝐰", "𝐱", "𝐲", "𝐳", "𝐀", "𝐁", "𝐂", "𝐃", "𝐄", "𝐅", "𝐆", "𝐇",
@@ -175,7 +134,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "δ",
-        keywords: &["greekAlphabet", "希腊", "字母", "greek", "δ"],
         symbols: &[
             "Α", "Β", "Γ", "Δ", "Ε", "Ζ", "Η", "Θ", "Ι", "Κ", "Λ", "Μ", "Ν", "Ξ", "Ο", "Π", "Ρ",
             "Σ", "Τ", "Υ", "Φ", "Χ", "Ψ", "Ω", "α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ",
@@ -184,7 +142,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "🆎",
-        keywords: &["circledChinese", "圆圈", "中文", "特别", "🆎"],
         symbols: &[
             "🅐", "🅑", "🅒", "🅓", "🅔", "🅕", "🅖", "🅗", "🅘", "🅙", "🅚", "🅛", "🅜", "🅝", "🅞", "🅟", "🅠",
             "🅡", "🅢", "🅣", "🅤", "🅥", "🅦", "🅧", "🅨", "🅩", "🆊", "🉐", "🈯", "🉑", "🈶", "🈚", "🈸",
@@ -194,7 +151,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "㎠",
-        keywords: &["unitSymbols", "单位", "unit", "长度", "面积", "体积", "㎠"],
         symbols: &[
             "㎚", "㎛", "㎜", "㎝", "㎞", "㎟", "㎠", "㎡", "㎢", "㎣", "㎤", "㎥", "㎦", "㎧",
             "㎨", "㎩", "㎪", "㎫", "㎬", "㎭", "㎮", "㎯", "㎰", "㎱", "㎲", "㎳", "㎴", "㎵",
@@ -208,14 +164,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "ぁ",
-        keywords: &[
-            "japaneseSymbols",
-            "日文",
-            "假名",
-            "japanese",
-            "五十音",
-            "ぁ",
-        ],
         symbols: &[
             "ぁ", "あ", "ぃ", "い", "ぅ", "う", "ぇ", "え", "ぉ", "お", "か", "が", "き", "ぎ",
             "く", "ぐ", "け", "げ", "こ", "ご", "さ", "ざ", "し", "じ", "す", "ず", "せ", "ぜ",
@@ -235,7 +183,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "ㅞ",
-        keywords: &["koreanSymbols", "韩文", "谚文", "korean", "ㅞ"],
         symbols: &[
             "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄸ", "ㄹ", "ㄺ", "ㄻ", "ㄼ", "ㄽ", "ㄾ",
             "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅃ", "ㅄ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅉ", "ㅊ", "ㅋ", "ㅌ",
@@ -248,15 +195,6 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "ɠ",
-        keywords: &[
-            "musicSymbols",
-            "音乐",
-            "音标",
-            "国际音标",
-            "ipa",
-            "乐器",
-            "ɠ",
-        ],
         symbols: &[
             "p", "b", "t", "d", "ʈ", "ɖ", "c", "ɟ", "k", "ɡ", "q", "ɢ", "ʔ", "m", "ɱ", "n", "ɳ",
             "ɲ", "ŋ", "ɴ", "ʙ", "r", "ʀ", "ⱱ", "ɾ", "ɽ", "ɸ", "β", "f", "v", "θ", "ð", "s", "z",
@@ -273,22 +211,12 @@ pub static GROUPS: &[SymbolGroup] = &[
     },
     SymbolGroup {
         category: "♈",
-        keywords: &["zodiacSymbols", "星座", "zodiac", "♈"],
         symbols: &[
             "♈", "♉", "♊", "♋", "♌", "♍", "♎", "♏", "♐", "♑", "♒", "♓",
         ],
     },
     SymbolGroup {
         category: "ㄎ",
-        keywords: &[
-            "pinyinSymbols",
-            "拼音",
-            "注音",
-            "声调",
-            "韵母",
-            "pinyin",
-            "ㄎ",
-        ],
         symbols: &[
             "ā", "á", "ǎ", "à", "ō", "ó", "ǒ", "ò", "ē", "é", "ě", "è", "ī", "í", "ǐ", "ì", "ū",
             "ú", "ǔ", "ù", "ǖ", "ǘ", "ǚ", "ǜ", "ü", "ń", "ň", "ǹ", "ɑ", "ê", "ɡ", "i", "ü", "üe",
@@ -301,95 +229,3 @@ pub static GROUPS: &[SymbolGroup] = &[
         ],
     },
 ];
-
-fn item(group: &SymbolGroup, symbol: &'static str) -> EmojiItem {
-    EmojiItem {
-        id: symbol.to_string(),
-        text: symbol.to_string(),
-        image_url: None,
-        category: group.category.to_string(),
-    }
-}
-
-/// 按查询词搜索符号。空查询返回全部（按分组顺序）。
-///
-/// 匹配规则（按分组处理）：
-/// - 查询词命中分类名或任一关键词（子串）→ 整组符号纳入；
-/// - 否则仅纳入文本包含查询词的符号。
-pub fn search(query: &str, top_k: usize) -> Vec<EmojiItem> {
-    let q = query.trim();
-    let mut out = Vec::new();
-    for group in GROUPS {
-        let group_matches = q.is_empty()
-            || group.category.contains(q)
-            || group.keywords.iter().any(|k| k.contains(q));
-        if group_matches {
-            for s in group.symbols {
-                out.push(item(group, s));
-                if out.len() >= top_k {
-                    return out;
-                }
-            }
-        } else {
-            for s in group.symbols {
-                if s.contains(q) {
-                    out.push(item(group, s));
-                    if out.len() >= top_k {
-                        return out;
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_search_empty_returns_all() {
-        let all = search("", usize::MAX);
-        let total: usize = GROUPS.iter().map(|g| g.symbols.len()).sum();
-        assert_eq!(all.len(), total);
-        // 空查询按分组顺序排列
-        assert_eq!(all[0].text, "。");
-    }
-
-    #[test]
-    fn test_search_by_category_id() {
-        let math = search("mathematicalSymbols", usize::MAX);
-        assert!(math.iter().any(|e| e.text == "∞"));
-        assert!(math.iter().all(|e| e.category == "数"));
-    }
-
-    #[test]
-    fn test_search_by_chinese_keyword() {
-        // 「箭头」命中 arrowSymbols 分组关键词
-        let arrows = search("箭头", usize::MAX);
-        assert!(arrows.iter().any(|e| e.text == "→"));
-        assert!(arrows.iter().all(|e| e.category == "⇌"));
-    }
-
-    #[test]
-    fn test_search_by_symbol_char() {
-        let star = search("★", usize::MAX);
-        assert!(star.iter().any(|e| e.text == "★"));
-        assert_eq!(star[0].text, "★");
-    }
-
-    #[test]
-    fn test_search_top_k() {
-        let limited = search("", 3);
-        assert_eq!(limited.len(), 3);
-        assert_eq!(limited[0].text, "。");
-        assert_eq!(limited[1].text, "，");
-        assert_eq!(limited[2].text, "、");
-    }
-
-    #[test]
-    fn test_search_no_match() {
-        assert!(search("xyzabc", usize::MAX).is_empty());
-    }
-}

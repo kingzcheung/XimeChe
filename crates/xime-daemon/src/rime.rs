@@ -97,6 +97,41 @@ impl RimeEngine {
         }
     }
 
+    /// 可切换方案列表 (id, 显示名)（托盘菜单用）。
+    ///
+    /// id 来自 levers 的 switcher 列表；显示名读 `<id>.schema.yaml` 的
+    /// `name:` 行（解析不到用 id）。levers 不碰会话，失败退化为空列表。
+    pub fn available_schemas(&self) -> Vec<(String, String)> {
+        let Ok(manager) = librime::SwitcherSettings::new() else {
+            return Vec::new();
+        };
+        let Ok(ids) = manager.get_available_schema_list() else {
+            return Vec::new();
+        };
+        let user_dir = get_config_dir();
+        let (shared_dir, _) = get_data_dirs();
+        ids.into_iter()
+            .map(|id| {
+                let name = [user_dir.as_path(), shared_dir.as_path()]
+                    .iter()
+                    .find_map(|dir| {
+                        std::fs::read_to_string(dir.join(format!("{id}.schema.yaml"))).ok()
+                    })
+                    .and_then(|text| {
+                        text.lines()
+                            .filter_map(|line| {
+                                let rest = line.trim().strip_prefix("name:")?;
+                                let v = rest.trim().trim_matches('"').trim_matches('\'');
+                                (!v.is_empty()).then_some(v.to_string())
+                            })
+                            .next()
+                    })
+                    .unwrap_or_else(|| id.clone());
+                (id, name)
+            })
+            .collect()
+    }
+
     pub fn select_schema(&mut self, schema_id: &str) -> bool {
         if let Some(session) = self.session.as_ref() {
             match session.select_schema(schema_id) {
@@ -114,7 +149,33 @@ impl RimeEngine {
         }
     }
 
+    /// 关闭会话 → 执行 levers 词典操作（导出/导入要求 userdb 独占）→ 重建会话。
+    ///
+    /// 对齐 librime user_dict_manager 的 CAVEAT 与安卓/XimeYao 的
+    /// withUserDictClosed：**正在输入的 composition 会丢**（设置页词典操作
+    /// 与打字互斥的代价）。重建失败只记警告——后续按键无会话即无响应，
+    /// 重启 daemon 可恢复（导出失败不至此，见 wayland 层错误路径）。
+    pub fn with_user_dict_closed<T>(&mut self, op: impl FnOnce() -> T) -> T {
+        if let Some(session) = self.session.take() {
+            drop(session); // Drop → close（释放 userdb 的 LevelDB 锁）
+            debug!("Session closed for user dict operation");
+        }
+        let out = op();
+        self.session = librime::create_session().ok();
+        if self.session.is_some() {
+            debug!("Session recreated after user dict operation");
+        } else {
+            warn!("Failed to recreate session after user dict operation");
+        }
+        out
+    }
+
     pub fn redeploy(&mut self) {
+        let _ = self.redeploy_with_result();
+    }
+
+    /// 重新部署并返回结果（托盘「重新部署」后发桌面通知用）。
+    pub fn redeploy_with_result(&mut self) -> librime::DeployResult {
         debug!("Redeploying Rime...");
         librime::finalize();
 
@@ -125,10 +186,12 @@ impl RimeEngine {
         traits.set_log_dir(&self.config_dir);
 
         librime::setup(&mut traits);
-        if let Err(e) = librime::initialize(&mut traits) {
+        let result = if let Err(e) = librime::initialize(&mut traits) {
             error!("Failed to reinitialize Rime: {}", e);
+            librime::DeployResult::Failure
         } else {
-            match librime::full_deploy_and_wait() {
+            let result = librime::full_deploy_and_wait();
+            match result {
                 librime::DeployResult::Success => debug!("Rime redeployed successfully"),
                 librime::DeployResult::Failure => warn!("Rime deploy failed"),
             }
@@ -139,7 +202,9 @@ impl RimeEngine {
 
             self.session = librime::create_session().ok();
             debug!("New Rime session created after deployment");
-        }
+            result
+        };
+        result
     }
 }
 

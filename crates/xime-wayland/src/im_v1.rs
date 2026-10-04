@@ -19,7 +19,10 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::protocol::*;
 use wayland_client::{event_created_child, globals::registry_queue_init, Connection, EventQueue};
 use wayland_client::{Dispatch, Proxy, QueueHandle};
-use xime_ui::{CandidateItem, GridItem, IcedSurface, ListItem, ListKind, PanelTheme, PanelView};
+use xime_ui::{
+    grid_panel_height, list_panel_height, menu_panel_height, CandidateItem, IcedSurface, PanelGrid,
+    PanelList, PanelPage, PanelTheme, PANEL_MIN_WIDTH,
+};
 
 pub mod __interfaces {
     use wayland_client::protocol::__interfaces::*;
@@ -61,7 +64,10 @@ pub struct InputMethodV1Data {
     pub pointer_events: Arc<Mutex<Vec<PointerEvent>>>,
     pub pointer_pos: Arc<Mutex<(f64, f64)>>,
     /// 面板展开视图（菜单网格/内容网格），影响候选栏增高与渲染。
-    pub panel_view: PanelView,
+    /// 当前面板页面（None = 收起）；数据（列表/网格）由 daemon 注入。
+    pub panel_page: Option<PanelPage>,
+    pub panel_list: PanelList,
+    pub panel_grid: PanelGrid,
     pub modifiers: Arc<Mutex<(u32, u32, u32, u32)>>,
     pub keymap_pending: Arc<Mutex<Option<(OwnedFd, usize)>>>,
 }
@@ -618,8 +624,8 @@ impl WaylandConnectionV1 {
     }
 
     /// 面板展开视图（菜单网格/内容网格）。
-    pub fn panel_view(&self) -> PanelView {
-        self.state.panel_view.clone()
+    pub fn panel_page(&self) -> Option<PanelPage> {
+        self.state.panel_page
     }
 
     pub fn get_modifiers(&self) -> (u32, u32, u32, u32) {
@@ -711,29 +717,31 @@ impl WaylandConnectionV1 {
         theme: &PanelTheme,
     ) -> Result<()> {
         // 面板展开视图决定增高与宽度（候选栏高度随主题字号自适应）
-        let panel_view = self.state.panel_view.clone();
-        let panel_height = xime_ui::panel_height_for(&panel_view);
-        let height = theme.bar_height() + panel_height;
+        let page = self.state.panel_page;
+        let panel_height = match page {
+            Some(PanelPage::Menu) => menu_panel_height(),
+            Some(PanelPage::Clipboard | PanelPage::QuickSend) => list_panel_height(),
+            Some(_) => {
+                let tabs = self.state.panel_grid.tab_count();
+                grid_panel_height(tabs, self.state.panel_grid.has_pager)
+            }
+            None => 0,
+        };
+        // 面板区与候选栏之间有 PANEL_GAP（对齐 XimeYao）：面板展开时
+        // buffer 高度多出这 4px 缝隙，命中换算同步（daemon 指针事件）。
+        let height = theme.bar_height()
+            + if panel_height > 0 {
+                xime_ui::menu::PANEL_GAP + panel_height
+            } else {
+                0
+            };
 
         // Take surface out of self for width measurement and drawing
         let mut surface = self.renderer.take().unwrap_or_default();
         // measure_candidates 已包含右侧菜单按钮宽度
         let measured = surface.measure_candidates(candidates, theme);
-        // 内容网格按最宽项自适应列宽/列数，宽度不低于候选栏
-        let width = match &panel_view {
-            PanelView::Content { items, .. } => {
-                let widest = items
-                    .iter()
-                    .map(|i| xime_ui::content_text_width(&i.text))
-                    .max()
-                    .unwrap_or(0);
-                let cell = xime_ui::content_cell_width(widest);
-                xime_ui::content_panel_width(cell, xime_ui::content_columns_for(cell)).max(measured)
-            }
-            // 列表页最小宽度（无候选词时保证列表可读）
-            PanelView::List { .. } => measured.max(xime_ui::LIST_MIN_PANEL_WIDTH),
-            _ => measured,
-        };
+        // 面板宽度跟随候选栏，但不小于面板最小宽度（对齐 XimeYao）。
+        let width = measured.max(PANEL_MIN_WIDTH);
 
         if self.candidate_surface.is_none() {
             self.create_candidate_surface()?;
@@ -786,7 +794,9 @@ impl WaylandConnectionV1 {
             candidates,
             highlighted_index,
             theme,
-            &panel_view,
+            page,
+            &self.state.panel_list.clone(),
+            &self.state.panel_grid.clone(),
         );
 
         unsafe {
@@ -831,47 +841,25 @@ impl WaylandConnectionV1 {
         width
     }
 
-    /// 打开菜单：仅设置状态（候选栏增高由下一次 show_candidate_window 渲染）。
-    pub fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<()> {
-        self.state.panel_view = PanelView::Menu(active_index);
-        debug!("Menu panel flag set (rendered on next candidate refresh)");
-        Ok(())
-    }
-
-    /// 显示内容面板（表情/符号网格）：仅设置状态，渲染随下一次
-    /// show_candidate_window 生效。
-    pub fn show_content_panel(
+    /// 打开面板页面：仅设置页标志与注入数据（渲染随下一次
+    /// show_candidate_window 生效；高度按页面计算）。
+    pub fn show_panel(
         &mut self,
-        items: &[GridItem],
-        highlighted: Option<usize>,
+        page: PanelPage,
+        list: &PanelList,
+        grid: &PanelGrid,
     ) -> Result<()> {
-        self.state.panel_view = PanelView::Content {
-            items: items.to_vec(),
-            highlighted,
-        };
-        debug!("Content panel set ({} items)", items.len());
+        self.state.panel_page = Some(page);
+        self.state.panel_list = list.clone();
+        self.state.panel_grid = grid.clone();
+        debug!("Panel page set to {page:?} (rendered on next candidate refresh)");
         Ok(())
     }
 
-    /// 显示列表页面板（剪贴板/快捷发送）：仅设置状态，渲染随下一次
-    /// show_candidate_window 生效。
-    pub fn show_list_panel(
-        &mut self,
-        kind: ListKind,
-        items: &[ListItem],
-        highlighted: Option<usize>,
-    ) -> Result<()> {
-        self.state.panel_view = PanelView::List {
-            kind,
-            items: items.to_vec(),
-            highlighted,
-        };
-        debug!("List panel set ({} items, {:?})", items.len(), kind);
-        Ok(())
-    }
-
-    pub fn hide_menu_panel(&mut self) {
-        self.state.panel_view = PanelView::Closed;
+    pub fn hide_panel(&mut self) {
+        self.state.panel_page = None;
+        self.state.panel_list = PanelList::default();
+        self.state.panel_grid = PanelGrid::default();
     }
 
     /// Show a single key root display window
@@ -973,6 +961,19 @@ impl WaylandConnectionV1 {
     }
 
     fn create_anonymous_file(size: u32) -> Result<OwnedFd> {
+        // memfd：纯匿名内存，不落文件系统。之前用 O_TMPFILE 建在 /tmp（tmpfs），
+        // tmpfs 写满时 set_len 仍成功（sparse），但写页时空间不足 → SIGBUS
+        // （2026-10-02 实锤：t9 测试日志塞满 /tmp 导致候选窗崩溃）。
+        if let Ok(fd) = nix::sys::memfd::memfd_create(
+            c"xime-shm",
+            nix::sys::memfd::MemFdCreateFlag::MFD_CLOEXEC,
+        ) {
+            let file = std::fs::File::from(fd);
+            file.set_len(size as u64)?;
+            return Ok(file.into());
+        }
+
+        // 回退：老内核无 memfd 时用 O_TMPFILE。
         let fd = nix::fcntl::open(
             &std::env::temp_dir(),
             nix::fcntl::OFlag::O_TMPFILE | nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_CLOEXEC,

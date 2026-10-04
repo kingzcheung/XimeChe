@@ -8,6 +8,20 @@ pub enum DaemonCommand {
     ReloadStyle,
     ReloadPlugins,
     SelectSchema(String, oneshot::Sender<bool>),
+    /// 读取用户词典词条（设置程序词典页）。在 wayland 线程执行：levers
+    /// 导出要求 userdb 独占（关会话→导出→重建，见 RimeEngine::
+    /// with_user_dict_closed），不能与按键路径并发。
+    ListDictEntries(
+        String,
+        String,
+        oneshot::Sender<Result<crate::user_dict::DictEntriesResult, String>>,
+    ),
+    /// 用户词典 levers 写操作（造词/删除/备份/恢复/导出/导入）。同样在
+    /// wayland 线程 `with_user_dict_closed` 内执行。
+    UserDictOp(
+        crate::user_dict::UserDictOp,
+        oneshot::Sender<Result<i64, String>>,
+    ),
     /// 系统亮/暗色模式变化（portal color-scheme，true = 暗色）。
     DarkMode(bool),
     Shutdown,

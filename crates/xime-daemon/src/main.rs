@@ -72,14 +72,24 @@ fn main() -> anyhow::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
-    // 注入 Rime 数据目录（由 libximecore 解析默认双目录：只读 shared + 用户 user）。
-    // 用户目录无同名文件时 librime 自动回退到 shared，更新默认方案不影响用户数据。
-    let paths = xime_config::default_rime_paths();
-    info!(
-        "rime dirs: shared={}, user={}",
-        paths.shared_data_dir.display(),
-        paths.user_data_dir.display()
-    );
+    // 单目录模型（对齐 XimeYao / Xime 3.0）：shared == user == ~/.config/xime/rime。
+    // 随包方案数据（dev-install 装到 ~/.local/share/xime/rime-data 或系统的
+    // /usr/share/xime/rime-data）降级为「数据源」，启动时部署进 rime 目录：
+    // 首装全量、升级只强更内容有变化且非 custom 的文件（保护用户定制与弃用方案）。
+    // 旧 shared/user 分离导致方案来源混乱（码表在 shared、用户数据在 user，
+    // 词典/词表读取到处回退查找）。
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let rime_dir = std::path::PathBuf::from(&home).join(".config/xime/rime");
+    let bundled_sources = [
+        std::path::PathBuf::from(&home).join(".local/share/xime/rime-data"),
+        std::path::PathBuf::from("/usr/share/xime/rime-data"),
+    ];
+    xime_config::ensure_bundled_rime_data(&bundled_sources, &rime_dir);
+    let paths = xime_config::RimePaths {
+        shared_data_dir: rime_dir.clone(),
+        user_data_dir: rime_dir,
+    };
+    info!("rime dir (single): {}", paths.user_data_dir.display());
     let _ = xime_config::set_rime_paths(paths);
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -170,6 +180,14 @@ fn main() -> anyhow::Result<()> {
                         }
                         MenuAction::Deploy => {
                             command_tx.send(DaemonCommand::Deploy).ok();
+                        }
+                        MenuAction::SelectSchema(schema_id) => {
+                            // 结果接收端即弃：托盘切换不关心结果，
+                            // wayland 侧 send 失败已被 `let _` 忽略。
+                            let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+                            command_tx
+                                .send(DaemonCommand::SelectSchema(schema_id, result_tx))
+                                .ok();
                         }
                         MenuAction::Exit => {
                             command_tx.send(DaemonCommand::Shutdown).ok();

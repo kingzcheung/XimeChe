@@ -1,5 +1,37 @@
 # XimeChe（曦码·澈输入法）重要决策
 
+## 2026-10-01: rime 数据目录迁移单目录模型（对齐 XimeYao）
+
+**问题**：Unix 沿用双目录模型（shared=`~/.local/share/xime/rime-data` 只读装
+方案，user=`~/.config/xime/rime` 放用户数据），实际暴露三类问题：
+1. 方案来源混乱：方案码表在 shared、部署产物和用户数据在 user，方案词表、
+   快捷短语、词典管理等一切"读方案目录"的功能都要做目录回退查找；
+2. 升级语义缺失：shared 是安装脚本铺的静态副本，方案包更新后用户目录无感知，
+   "用户弃用的方案"、"用户定制"与"待升级文件"无法区分；
+3. 与跨端契约漂移：XimeYao（Windows）与 Xime（Android）已先后迁移到单目录
+   （XimeYao DECISIONS 2026-09-11 明言"旧 shared/user 分离导致方案来源混乱"），
+   libximecore 的跨端功能（方案词表/词典管理）被迫为 Linux 维护特例。
+
+**决策**：
+1. `shared_data_dir == user_data_dir == ~/.config/xime/rime`（daemon/setup
+   启动时显式 `set_rime_paths`，libximecore 的 `default_rime_paths` 默认值
+   不变——macOS 等其他宿主不受影响）；
+2. dev-install/install 铺的 `~/.local/share/xime/rime-data`（或系统
+   `/usr/share/xime/rime-data`）**降级为随包数据源**：启动时经
+   `xime_config::ensure_bundled_rime_data` 部署进 rime 目录——
+   - 首装（rime 目录无 `*.schema.yaml`）全量复制（递归含 lua/）；
+   - 升级只强更"内容有变化且文件名不含 custom"的文件；
+   - 用户弃用的 builtin 方案不强更（以 default.custom.yaml 启用列表为基准）；
+3. `schema_dict` 等读路径全部回到单目录签名，删除目录数组回退。
+
+**理由**：
+1. XimeYao 同款迁移已验证（其 server 启动部署逻辑逐行移植）；
+2. 部署语义解决了双目录下"更新方案包"只能靠重跑安装脚本的问题；
+3. 用户数据一次性迁移（首装路径触发全量复制），userdb/词库/custom 全保留。
+
+**验证**：真机迁移后 userdb（96120 条词库）、wubi86.custom.yaml、
+custom_phrase.txt 无损；方案词表 91397 条 40ms；libximecore 4 组部署单测。
+
 ## 2026-08-15: 插件下载即安装 + daemon 插件宿主 + emoji 候选窗
 
 **问题**：插件下载后需手动"安装"，且 daemon 无插件加载能力，插件安装后不生效。

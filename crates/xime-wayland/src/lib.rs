@@ -17,7 +17,7 @@ use std::os::unix::net::UnixStream;
 use wayland_backend::client::Backend;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::Connection;
-use xime_ui::{CandidateItem, ListItem, ListKind, PanelTheme};
+use xime_ui::{CandidateItem, PanelTheme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
@@ -67,23 +67,15 @@ pub trait ImBackend {
         200
     }
     fn hide_candidate_window(&mut self);
-    /// 显示菜单面板（候选栏右侧按钮点击后展开的功能入口列表）。
-    /// 面板内容含高亮入口（active_index = None 表示无高亮）。
-    fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<(), String>;
-    /// 显示内容面板（表情/符号网格）。渲染随下一次 show_candidate_window 生效。
-    fn show_content_panel(
+    /// 打开面板页面（菜单/列表/网格）。数据由 daemon 注入（daemon 持有
+    /// 权威状态，进页时 reload 一次），渲染随下一次 show_candidate_window 生效。
+    fn show_panel(
         &mut self,
-        items: &[xime_ui::GridItem],
-        highlighted: Option<usize>,
+        page: xime_ui::PanelPage,
+        list: &xime_ui::PanelList,
+        grid: &xime_ui::PanelGrid,
     ) -> Result<(), String>;
-    /// 显示列表页面板（剪贴板/快捷发送）。渲染随下一次 show_candidate_window 生效。
-    fn show_list_panel(
-        &mut self,
-        kind: ListKind,
-        items: &[ListItem],
-        highlighted: Option<usize>,
-    ) -> Result<(), String>;
-    fn hide_menu_panel(&mut self);
+    fn hide_panel(&mut self);
     fn show_root_window(&mut self, key: char, root: &str, theme: &PanelTheme)
         -> Result<(), String>;
     fn hide_root_window(&mut self);
@@ -155,32 +147,17 @@ impl ImBackend for im_v1::WaylandConnectionV1 {
         self.hide_candidate_window()
     }
 
-    fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<(), String> {
-        self.show_menu_panel(active_index)
-            .map_err(|e| e.to_string())
-    }
-
-    fn show_content_panel(
+    fn show_panel(
         &mut self,
-        items: &[xime_ui::GridItem],
-        highlighted: Option<usize>,
+        page: xime_ui::PanelPage,
+        list: &xime_ui::PanelList,
+        grid: &xime_ui::PanelGrid,
     ) -> Result<(), String> {
-        self.show_content_panel(items, highlighted)
-            .map_err(|e| e.to_string())
+        self.show_panel(page, list, grid).map_err(|e| e.to_string())
     }
 
-    fn show_list_panel(
-        &mut self,
-        kind: ListKind,
-        items: &[ListItem],
-        highlighted: Option<usize>,
-    ) -> Result<(), String> {
-        self.show_list_panel(kind, items, highlighted)
-            .map_err(|e| e.to_string())
-    }
-
-    fn hide_menu_panel(&mut self) {
-        self.hide_menu_panel()
+    fn hide_panel(&mut self) {
+        self.hide_panel()
     }
 
     fn show_root_window(
@@ -265,32 +242,17 @@ impl ImBackend for im_v2::WaylandConnectionV2 {
         self.hide_candidate_window()
     }
 
-    fn show_menu_panel(&mut self, active_index: Option<usize>) -> Result<(), String> {
-        self.show_menu_panel(active_index)
-            .map_err(|e| e.to_string())
-    }
-
-    fn show_content_panel(
+    fn show_panel(
         &mut self,
-        items: &[xime_ui::GridItem],
-        highlighted: Option<usize>,
+        page: xime_ui::PanelPage,
+        list: &xime_ui::PanelList,
+        grid: &xime_ui::PanelGrid,
     ) -> Result<(), String> {
-        self.show_content_panel(items, highlighted)
-            .map_err(|e| e.to_string())
+        self.show_panel(page, list, grid).map_err(|e| e.to_string())
     }
 
-    fn show_list_panel(
-        &mut self,
-        kind: ListKind,
-        items: &[ListItem],
-        highlighted: Option<usize>,
-    ) -> Result<(), String> {
-        self.show_list_panel(kind, items, highlighted)
-            .map_err(|e| e.to_string())
-    }
-
-    fn hide_menu_panel(&mut self) {
-        self.hide_menu_panel()
+    fn hide_panel(&mut self) {
+        self.hide_panel()
     }
 
     fn show_root_window(

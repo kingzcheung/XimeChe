@@ -1,27 +1,39 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 use tracing::debug;
 use zbus::zvariant::Value;
 use zbus::{interface, object_server::SignalEmitter};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuAction {
     ToggleMode,
     Settings,
     Deploy,
     Exit,
+    /// 切换到指定输入方案（托盘菜单动态项）。
+    SelectSchema(String),
 }
 
+/// 动态方案项的起始 id（固定项占 1..10）。
+const SCHEMA_ID_BASE: i32 = 10;
+
 pub struct DBusMenu {
-    revision: u32,
+    revision: std::sync::atomic::AtomicU32,
     action_tx: Option<Sender<MenuAction>>,
+    /// 可切换方案 (id, 显示名)；空 = 未注入（不渲染该组）。
+    schemas: Mutex<Vec<(String, String)>>,
+    /// 当前选中方案 id（菜单里打 ✓）。
+    current_schema: Mutex<String>,
 }
 
 impl DBusMenu {
     pub fn new() -> Self {
         Self {
-            revision: 0,
+            revision: std::sync::atomic::AtomicU32::new(0),
             action_tx: None,
+            schemas: Mutex::new(Vec::new()),
+            current_schema: Mutex::new(String::new()),
         }
     }
 }
@@ -35,16 +47,42 @@ impl Default for DBusMenu {
 impl DBusMenu {
     pub fn with_action_channel(action_tx: Sender<MenuAction>) -> Self {
         Self {
-            revision: 0,
+            revision: std::sync::atomic::AtomicU32::new(0),
             action_tx: Some(action_tx),
+            schemas: Mutex::new(Vec::new()),
+            current_schema: Mutex::new(String::new()),
         }
+    }
+
+    /// 更新方案菜单（内容变化时 revision 自增，由调用方决定何时发信号刷新）。
+    pub fn set_schemas(&self, schemas: Vec<(String, String)>, current: String) {
+        let changed = {
+            let mut list = self.schemas.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cur = self
+                .current_schema
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let changed = *list != schemas || *cur != current;
+            *list = schemas;
+            *cur = current;
+            changed
+        };
+        if changed {
+            self.revision
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 当前布局 revision（发 LayoutUpdated 信号用）。
+    pub fn revision(&self) -> u32 {
+        self.revision.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 #[interface(name = "com.canonical.dbusmenu")]
 impl DBusMenu {
     #[zbus(signal)]
-    async fn layout_updated(
+    pub async fn layout_updated(
         signal_emitter: &SignalEmitter<'_>,
         revision: u32,
         parent: i32,
@@ -61,17 +99,26 @@ impl DBusMenu {
 
     async fn event(&self, id: i32, event_type: &str, _data: Value<'_>, _timestamp: u32) {
         if event_type == "clicked" {
-            if let Some(tx) = &self.action_tx {
-                let action = match id {
-                    1 => MenuAction::ToggleMode,
-                    3 => MenuAction::Settings,
-                    4 => MenuAction::Deploy,
-                    5 => MenuAction::Exit,
-                    _ => return,
-                };
-                let _ = tx.send(action).await;
-                debug!("Menu item {} clicked, action: {:?}", id, action);
-            }
+            let Some(tx) = &self.action_tx else {
+                return;
+            };
+            let action = match id {
+                1 => MenuAction::ToggleMode,
+                3 => MenuAction::Settings,
+                4 => MenuAction::Deploy,
+                5 => MenuAction::Exit,
+                n if n >= SCHEMA_ID_BASE => {
+                    let index = (n - SCHEMA_ID_BASE) as usize;
+                    let list = self.schemas.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some((schema_id, _)) = list.get(index) else {
+                        return;
+                    };
+                    MenuAction::SelectSchema(schema_id.clone())
+                }
+                _ => return,
+            };
+            debug!("Menu item {} clicked, action: {:?}", id, action);
+            let _ = tx.send(action).await;
         }
     }
 
@@ -92,7 +139,7 @@ impl DBusMenu {
     )> {
         let layout = if parent_id == 0 {
             let props = HashMap::from([("children-display".to_string(), Value::new("submenu"))]);
-            let children: Vec<Value<'static>> = vec![
+            let mut children: Vec<Value<'static>> = vec![
                 Value::new((
                     1,
                     HashMap::from([
@@ -106,6 +153,33 @@ impl DBusMenu {
                     HashMap::from([("type".to_string(), Value::new("separator"))]),
                     Vec::<Value<'static>>::new(),
                 )),
+            ];
+            // 方案切换组（对齐 Android menubar / XimeYao 托盘）：当前项打 ✓。
+            {
+                let list = self.schemas.lock().unwrap_or_else(|e| e.into_inner());
+                let current = self
+                    .current_schema
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for (index, (schema_id, name)) in list.iter().enumerate() {
+                    let label = if *schema_id == *current {
+                        format!("✓ {name}")
+                    } else {
+                        name.clone()
+                    };
+                    children.push(Value::new((
+                        SCHEMA_ID_BASE + index as i32,
+                        HashMap::from([("label".to_string(), Value::new(label))]),
+                        Vec::<Value<'static>>::new(),
+                    )));
+                }
+            }
+            children.push(Value::new((
+                2,
+                HashMap::from([("type".to_string(), Value::new("separator"))]),
+                Vec::<Value<'static>>::new(),
+            )));
+            children.extend([
                 Value::new((
                     3,
                     HashMap::from([
@@ -130,12 +204,15 @@ impl DBusMenu {
                     ]),
                     Vec::<Value<'static>>::new(),
                 )),
-            ];
+            ]);
             (0, props, children)
         } else {
             (parent_id, HashMap::new(), Vec::new())
         };
-        Ok((self.revision, layout))
+        Ok((
+            self.revision.load(std::sync::atomic::Ordering::Relaxed),
+            layout,
+        ))
     }
 
     fn get_group_properties(
@@ -166,23 +243,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_menu_action_toggle_mode() {
-        assert_eq!(MenuAction::ToggleMode as i32, 0);
-    }
-
-    #[test]
-    fn test_menu_action_settings() {
-        assert_eq!(MenuAction::Settings as i32, 1);
-    }
-
-    #[test]
-    fn test_menu_action_deploy() {
-        assert_eq!(MenuAction::Deploy as i32, 2);
-    }
-
-    #[test]
-    fn test_menu_action_exit() {
-        assert_eq!(MenuAction::Exit as i32, 3);
+    fn test_menu_action_variants_distinct() {
+        // SelectSchema 带字段后枚举不再支持 as-cast，改验判别互异性。
+        assert_ne!(
+            std::mem::discriminant(&MenuAction::ToggleMode),
+            std::mem::discriminant(&MenuAction::Settings)
+        );
+        assert_ne!(
+            std::mem::discriminant(&MenuAction::Deploy),
+            std::mem::discriminant(&MenuAction::Exit)
+        );
+        assert_eq!(
+            MenuAction::SelectSchema("wubi86".into()),
+            MenuAction::SelectSchema("wubi86".into())
+        );
     }
 
     #[test]
@@ -202,7 +276,7 @@ mod tests {
     #[test]
     fn test_menu_action_clone() {
         let original = MenuAction::Exit;
-        let cloned = original;
+        let cloned = original.clone();
         assert_eq!(original, cloned);
     }
 
@@ -210,13 +284,13 @@ mod tests {
     fn test_dbusmenu_new() {
         let menu = DBusMenu::new();
         assert!(menu.action_tx.is_none());
-        assert_eq!(menu.revision, 0);
+        assert_eq!(menu.revision(), 0);
     }
 
     #[test]
     fn test_dbusmenu_default() {
         let menu = DBusMenu::default();
         assert!(menu.action_tx.is_none());
-        assert_eq!(menu.revision, 0);
+        assert_eq!(menu.revision(), 0);
     }
 }

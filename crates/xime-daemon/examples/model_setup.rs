@@ -45,7 +45,7 @@ fn main() {
                 for e in std::fs::read_dir(&d).unwrap() {
                     let p = e.unwrap().path();
                     if p.is_dir() { stack.push(p); }
-                    else if p.file_name().map_or(false, |n| n == name) { return Some(p); }
+                    else if p.file_name().is_some_and(|n| n == name) { return Some(p); }
                 }
             }
             None

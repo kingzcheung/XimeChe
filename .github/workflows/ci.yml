@@ -23,6 +23,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             librime-dev \
+            libdbus-1-dev \
             libwayland-dev \
             wayland-protocols \
             libxkbcommon-dev \
@@ -30,6 +31,12 @@ jobs:
             libfontconfig1-dev \
             libfreetype6-dev \
             pkg-config
+
+      # .cargo/config.toml 把 libximecore patch 到 ../libximecore（本地开发
+      # 工作流）；CI 上不存在该路径时 cargo 回退 Cargo.lock 锁定的旧 rev，
+      # 缺语音相关 API 会导致编译失败——检出同仓库最新 main 保持一致。
+      - name: Checkout libximecore
+        run: git clone --depth 1 https://github.com/ximeiorg/libximecore.git ../libximecore
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

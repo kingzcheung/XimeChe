@@ -375,6 +375,16 @@ impl WaylandLoop {
                     }
                     last_active = is_active;
 
+                    if is_active {
+                        // 重新激活：清掉可能残留的面板状态（KWin 在部分应用
+                        // 上不发 Deactivate——面板在切窗后挂在屏幕上，回到
+                        // 可输入应用打字时它还开着）。候选栏不强行恢复：
+                        // 等 Rime 组合按需重建。
+                        debug!("Residual panel on re-activate, dismissing");
+                        panel_state = PanelState::Closed;
+                        panel = PanelData::default();
+                    }
+
                     if !is_active {
                         // 失焦（切换窗口/输入框）时彻底清理 UI 状态：
                         // 立即隐藏候选栏/菜单面板/Ctrl 字根窗口，关闭 emoji 面板，
@@ -1099,6 +1109,8 @@ impl WaylandLoop {
                 if !matches!(crate::speech::state(), SpeechState::Listening) {
                     return;
                 }
+                // 听写视图是纯候选栏：清掉可能残留的面板（同 redraw）。
+                c.hide_panel();
                 let display = if text.trim().is_empty() {
                     "🎙️ 正在听写…".to_string()
                 } else {
@@ -1343,6 +1355,11 @@ impl WaylandLoop {
         theme: &PanelTheme,
         candidate_window_visible: &mut bool,
     ) {
+        // 恢复"纯候选栏"视图前必须清面板：im 层的 show_candidate_window 按
+        // 自身残留的 panel_page 画面板，这里不清的话任何绕过 close_panel 的
+        // 渲染路径（语音反馈/激活恢复/KWin 不发 deactivate 的切窗）都会让
+        // 菜单面板挂在屏幕上、打字也收不掉（幂等：无面板时无害）。
+        c.hide_panel();
         let cached = self.candidate_cache.lock().ok().and_then(|g| g.clone());
         if let Some((candidates, highlighted)) = cached {
             if let Err(e) = c.show_candidate_window(&candidates, highlighted, theme) {

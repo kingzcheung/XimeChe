@@ -140,6 +140,8 @@ pub struct WaylandLoop {
     clipboard: Arc<ClipboardStore>,
     /// 剪贴板同步桥命令通道。
     sync_tx: std::sync::mpsc::Sender<SyncMessage>,
+    /// 语音听写会话桥（P10：🎙️ 触发 → 事件回主循环上屏）。
+    speech: crate::speech::SpeechBridge,
 }
 
 impl WaylandLoop {
@@ -157,6 +159,7 @@ impl WaylandLoop {
             candidate_cache: std::sync::Mutex::new(None),
             clipboard,
             sync_tx,
+            speech: crate::speech::SpeechBridge::spawn(),
         }
     }
 
@@ -390,6 +393,11 @@ impl WaylandLoop {
                         ctrl_root_visible = false;
                         last_input_keysym = None;
                         consumed_presses.clear();
+                        // 听写中失焦：停止会话（剩余文本经 finalize 迟到上屏，
+                        // 没有焦点的窗口上继续录音没有意义）。
+                        if self.speech.state() != crate::speech::SpeechState::Idle {
+                            self.speech.toggle();
+                        }
                         continue;
                     }
                 }
@@ -487,6 +495,11 @@ impl WaylandLoop {
                 &pe,
             );
         }
+
+        // 语音听写事件：上屏 / 候选栏实时反馈（worker 在后台线程，主循环只消费）。
+        self.speech.drain_events(|event| {
+            self.handle_speech_event(c, plugin_host, event, theme, candidate_window_visible);
+        });
 
         let events = c.pop_key_events();
         for event in events {
@@ -1061,6 +1074,90 @@ impl WaylandLoop {
         }
     }
 
+    /// 语音听写事件处理：Committed 上屏；状态/中间文本驱动候选栏实时反馈。
+    fn handle_speech_event(
+        &self,
+        c: &mut dyn ImBackend,
+        plugin_host: &mut PluginHost,
+        event: crate::speech::SpeechEvent,
+        theme: &PanelTheme,
+        candidate_window_visible: &mut bool,
+    ) {
+        use crate::speech::{SpeechEvent as Ev, SpeechState};
+        match event {
+            Ev::Committed(text) => {
+                // 停顿断句自动上屏（对齐 XimeYao：识别文本直接落光标处）。
+                c.commit_string(&text);
+                let _ = c.flush();
+                plugin_host.emit_text_committed(&text);
+                debug!(
+                    "Speech committed: {} ({} chars)",
+                    text,
+                    text.chars().count()
+                );
+            }
+            Ev::Partial(text) => {
+                // 听写中的实时反馈：候选栏显示 partial（空文本显示占位）。
+                if !matches!(self.speech.state(), SpeechState::Listening) {
+                    return;
+                }
+                let display = if text.trim().is_empty() {
+                    "🎙️ 正在听写…".to_string()
+                } else {
+                    format!("🎙️ {text}")
+                };
+                let candidates = vec![xime_ui::CandidateItem {
+                    text: display,
+                    comment: String::new(),
+                    index: 0,
+                }];
+                if let Err(e) = c.show_candidate_window(&candidates, 0, theme) {
+                    debug!("Speech partial render error: {e}");
+                }
+                let _ = c.flush();
+                *candidate_window_visible = true;
+            }
+            Ev::State(state) => match state {
+                SpeechState::Downloading(p) => {
+                    let candidates = vec![xime_ui::CandidateItem {
+                        text: format!("🎙️ 正在下载语音模型…{:.0}%", p * 100.0),
+                        comment: String::new(),
+                        index: 0,
+                    }];
+                    let _ = c.show_candidate_window(&candidates, 0, theme);
+                    let _ = c.flush();
+                    *candidate_window_visible = true;
+                }
+                SpeechState::Loading => {
+                    let candidates = vec![xime_ui::CandidateItem {
+                        text: "🎙️ 正在装载语音引擎…".to_string(),
+                        comment: String::new(),
+                        index: 0,
+                    }];
+                    let _ = c.show_candidate_window(&candidates, 0, theme);
+                    let _ = c.flush();
+                    *candidate_window_visible = true;
+                }
+                SpeechState::Listening => {
+                    // partial 事件随后就到，这里只标记可见。
+                    *candidate_window_visible = true;
+                }
+                SpeechState::Idle => {
+                    // 会话结束（用户停止或失败后）：恢复原候选栏。
+                    self.redraw_menu_candidates(c, theme, candidate_window_visible);
+                }
+            },
+            Ev::Error(message) => {
+                // 失败兜底：桌面通知 + 恢复候选栏。
+                let handle = self.rt_handle.clone();
+                handle.spawn(async move {
+                    notify_desktop("语音输入", &message).await;
+                });
+                self.redraw_menu_candidates(c, theme, candidate_window_visible);
+            }
+        }
+    }
+
     /// 处理候选栏菜单按钮 / 面板点击（命中测试与绘制同源：xime_ui::panel_hit）。
     #[allow(clippy::too_many_arguments)]
     fn handle_pointer_press(
@@ -1081,9 +1178,13 @@ impl WaylandLoop {
         let width = (*last_panel_width).max(PANEL_MIN_WIDTH);
         let bar = theme.bar_height();
 
-        // 候选栏区域：菜单按钮开合。
+        // 候选栏区域：菜单按钮开合。听写中点它 = 停止听写（🎙️ 结束入口）。
         if pe.y < bar as i32 {
             if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width, bar) {
+                if self.speech.state() == crate::speech::SpeechState::Listening {
+                    self.speech.toggle();
+                    return;
+                }
                 match panel_state {
                     PanelState::Closed => {
                         self.open_panel_page(
@@ -1127,12 +1228,11 @@ impl WaylandLoop {
                     xime_ui::menu::MenuCard::QuickSend => Some(PanelPage::QuickSend),
                     xime_ui::menu::MenuCard::Emoji => Some(PanelPage::Emoji),
                     xime_ui::menu::MenuCard::Symbol => Some(PanelPage::Symbol),
-                    // 语音输入：引擎未接，提示后留在菜单。
+                    // 语音输入：切换听写会话（开始/停止），面板收起让位给
+                    // 候选栏上的实时反馈（下载/装载/听写中的 partial 文本）。
                     xime_ui::menu::MenuCard::VoiceInput => {
-                        let handle = self.rt_handle.clone();
-                        handle.spawn(async move {
-                            notify_desktop("语音输入", "暂未开放：本地语音引擎还在路上").await;
-                        });
+                        self.speech.toggle();
+                        self.close_panel(c, panel, panel_state, theme, candidate_window_visible);
                         None
                     }
                     // 设置：启动设置程序（动作，不开子页）。

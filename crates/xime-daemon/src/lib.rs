@@ -7,6 +7,7 @@ mod plugin_host;
 mod recent_usage;
 mod rime;
 mod schema_dict;
+mod speech;
 mod symbols;
 mod user_dict;
 mod wayland;

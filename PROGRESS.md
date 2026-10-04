@@ -1,9 +1,38 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**候选栏面板按 XimeYao 现状完全重写（M1-M4 全部完成，待用户实机测试）**
-（2026-10-01 深夜）。XimeYao 移植 9/10（P0-P9 完成，P10 语音留待下轮）；
-候选栏菜单 UI/交互与 Windows 版对齐（6 卡片菜单 + 列表/网格子页 + 最近使用）。
+**P10 语音转文本 M1 完成：🎙️ 菜单触发 → PulseAudio 采音 → sherpa 流式
+识别 → 停顿自动上屏；模型自动下载（已预置就绪）**（2026-10-04）。
+候选栏面板已按 XimeYao 完全重写并合入 main（上屏后清组合+隐藏候选栏、
+PANEL_GAP 分离式面板卡片、R/B 通道修复、SHM memfd）。
+
+## 本次变更（2026-10-04）：P10-M1 语音转文本核心链路
+
+- **依赖**：workspace 引入 libximecore 的 xime-speech（patch 到本地）；
+  daemon 增 reqwest(blocking)/tar/bzip2/libloading
+- **crates/xime-daemon/src/speech.rs**（新）：
+  - 模型管理：首次使用自动下载 ModelScope tar.bz2（UA 必带，ModelScope
+    403 掉无 UA 客户端）→ 解压递归找四文件归位 → 校验
+    `~/.local/share/xime/models/<id>/`（默认 x-asr-480ms-zh-en-punct-int8
+    中英混输带标点 133.9MB）
+  - 采集：内嵌 dlopen 绑定 pa_simple_new/read/free（16kHz mono s16ne，
+    PipeWire 兼容；构建零系统依赖，缺失给可读错误）
+  - 会话：单 worker 独占 StreamingRecognizer（非 Send 共享语义），
+    命令进/事件出信箱；端点检测断句自动上屏；SpeechBridge 全 &self
+    （内部可变性），主循环 drain_events 消费
+- **接线**：🎙️ 卡片点击 = toggle（面板收起让位候选栏反馈）；听写中
+  候选栏显示「🎙️ partial」实时文本；下载/装载进度同通道；Committed
+  经主循环 commit_string 上屏；**听写中点菜单按钮 = 停止**；失焦自动
+  停止；Error 走桌面通知兜底
+- **运行库安装**：daemon rpath 加 `$ORIGIN/../share/xime/lib`；
+  dev-install.sh 从 sherpa 构建缓存拷 libsherpa-onnx-c-api.so/
+  libonnxruntime.so 到 ~/.local/share/xime/lib（ldd 验证命中）；
+  系统包（xime-pack）同布局适用
+- **验证**：模型下载→解压→四文件校验端到端通过；sherpa 装载 1.85s；
+  193 tests（+3 speech）/ clippy 全绿；examples/model_setup.rs（CLI
+  装模型）与 panel_snapshot/color_probe 同存供回归
+- **待实机验证（需用户）**：麦克风实际说话的识别质量、端点断句体验、
+  采集设备选择（默认源）
 
 ## 本次变更（2026-10-01 深夜）：候选栏面板完全重写（分支 panel-ximeyao-rewrite）
 

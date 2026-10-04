@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 authors = ["Kor1 <kingzcheung@gmail.com>"]
 license = "GPL-3.0-or-later"
@@ -25,6 +25,7 @@ librime = { git = "https://github.com/ximeiorg/libximecore.git", package = "libr
 xime-config = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-config" }
 xime-setup-lib = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-setup-lib" }
 xime-plugin = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-plugin" }
+xime-speech = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-speech" }
 
 # local crates
 xime-wayland = { path = "crates/xime-wayland" }

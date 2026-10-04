@@ -420,6 +420,29 @@ pub fn init() {
     info!("Speech bridge initialized");
 }
 
+/// worker/下载线程统一事件出口：先写视图（DBus 快照的权威来源，
+/// 不依赖主循环是否在 drain），再进事件通道（主循环做上屏/候选栏反馈）。
+fn emit(event: SpeechEvent, event_tx: &Sender<SpeechEvent>) {
+    {
+        let mut view = view().lock().unwrap_or_else(|p| p.into_inner());
+        match &event {
+            SpeechEvent::State(state) => {
+                view.state = Some(state.clone());
+                if *state != SpeechState::Listening {
+                    view.text.clear();
+                }
+            }
+            SpeechEvent::Partial(text) => view.text = text.clone(),
+            SpeechEvent::Committed(text) => view.text = text.clone(),
+            SpeechEvent::Error(e) => {
+                view.last_error = Some(e.clone());
+                view.download = None;
+            }
+        }
+    }
+    let _ = event_tx.send(event);
+}
+
 fn send_cmd(cmd: SpeechCommand) {
     match CMD_TX.get() {
         Some(tx) => {
@@ -461,7 +484,8 @@ pub fn test_stop() {
 }
 
 /// 主循环每轮拉取事件（副作用：上屏/候选栏/通知都在调用方做）。
-/// 同时把状态写进视图（DBus 状态快照的权威来源）。
+/// 视图已在 worker 的 emit 时更新——输入法未激活（setup 试听场景）
+/// 主循环不 drain，快照依然实时。
 pub fn drain_events(mut on_event: impl FnMut(SpeechEvent)) {
     let Some(rx) = EVENT_RX.get() else {
         return;
@@ -469,26 +493,7 @@ pub fn drain_events(mut on_event: impl FnMut(SpeechEvent)) {
     let rx = rx.lock().unwrap_or_else(|p| p.into_inner());
     loop {
         match rx.try_recv() {
-            Ok(event) => {
-                {
-                    let mut view = view().lock().unwrap_or_else(|p| p.into_inner());
-                    match &event {
-                        SpeechEvent::State(state) => {
-                            view.state = Some(state.clone());
-                            if *state != SpeechState::Listening {
-                                view.text.clear();
-                            }
-                        }
-                        SpeechEvent::Partial(text) => view.text = text.clone(),
-                        SpeechEvent::Committed(text) => view.text = text.clone(),
-                        SpeechEvent::Error(e) => {
-                            view.last_error = Some(e.clone());
-                            view.download = None;
-                        }
-                    }
-                }
-                on_event(event);
-            }
+            Ok(event) => on_event(event),
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,
         }
@@ -597,20 +602,23 @@ fn worker_loop(cmd_rx: Receiver<SpeechCommand>, event_tx: Sender<SpeechEvent>) {
                 let dir = models_root().join(&profile.id);
                 if !is_model_ready(&profile, &dir) {
                     // 引导去设置程序（候选栏 🎙️ 不做下载）。
-                    let _ = event_tx.send(SpeechEvent::Error(
-                        "语音模型未下载，请打开设置程序的「语音转文本」页下载".into(),
-                    ));
+                    emit(
+                        SpeechEvent::Error(
+                            "语音模型未下载，请打开设置程序的「语音转文本」页下载".into(),
+                        ),
+                        &event_tx,
+                    );
                     continue;
                 }
-                let _ = event_tx.send(SpeechEvent::State(SpeechState::Loading));
+                emit(SpeechEvent::State(SpeechState::Loading), &event_tx);
                 match run_listening_session(&profile, &cmd_rx, &event_tx) {
                     Ok(()) => info!("Speech session ended normally"),
                     Err(e) => {
                         error!("Speech session failed: {e:#}");
-                        let _ = event_tx.send(SpeechEvent::Error(format!("{e:#}")));
+                        emit(SpeechEvent::Error(format!("{e:#}")), &event_tx);
                     }
                 }
-                let _ = event_tx.send(SpeechEvent::State(SpeechState::Idle));
+                emit(SpeechEvent::State(SpeechState::Idle), &event_tx);
             }
             SpeechCommand::DownloadModel(id) => {
                 download_model_async(&id, event_tx.clone());
@@ -673,9 +681,10 @@ fn download_model_async(id: &str, _event_tx: Sender<SpeechEvent>) {
 fn handle_delete_model(id: &str, event_tx: Sender<SpeechEvent>) {
     let selected = read_selected_id();
     if id == selected && state() == SpeechState::Listening {
-        let _ = event_tx.send(SpeechEvent::Error(
-            "正在使用该模型听写，先停止后再删除".into(),
-        ));
+        emit(
+            SpeechEvent::Error("正在使用该模型听写，先停止后再删除".into()),
+            &event_tx,
+        );
         return;
     }
     let dir = models_root().join(id);
@@ -689,7 +698,7 @@ fn handle_delete_model(id: &str, event_tx: Sender<SpeechEvent>) {
             MODELS_REV.fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
-            let _ = event_tx.send(SpeechEvent::Error(format!("删除模型失败：{e}")));
+            emit(SpeechEvent::Error(format!("删除模型失败：{e}")), &event_tx);
         }
     }
 }
@@ -698,10 +707,10 @@ fn handle_delete_model(id: &str, event_tx: Sender<SpeechEvent>) {
 fn handle_select_model(id: &str, event_tx: Sender<SpeechEvent>) {
     let profile = AsrModelRegistry::profile_or_default(id);
     if !is_model_ready(&profile, &models_root().join(&profile.id)) {
-        let _ = event_tx.send(SpeechEvent::Error(format!(
-            "模型「{}」未下载，先下载再选择",
-            profile.name
-        )));
+        emit(
+            SpeechEvent::Error(format!("模型「{}」未下载，先下载再选择", profile.name)),
+            &event_tx,
+        );
         return;
     }
     match write_selected_id(id) {
@@ -710,7 +719,10 @@ fn handle_select_model(id: &str, event_tx: Sender<SpeechEvent>) {
             info!("Speech model selected: {id}");
         }
         Err(e) => {
-            let _ = event_tx.send(SpeechEvent::Error(format!("保存模型选择失败：{e}")));
+            emit(
+                SpeechEvent::Error(format!("保存模型选择失败：{e}")),
+                &event_tx,
+            );
         }
     }
 }
@@ -730,7 +742,7 @@ fn run_listening_session(
     // 采集（PulseAudio simple record：16k mono s16ne，dlopen 运行时绑定）。
     let mut capture = PulseCapture::new().map_err(|e| anyhow::anyhow!(e))?;
 
-    let _ = event_tx.send(SpeechEvent::State(SpeechState::Listening));
+    emit(SpeechEvent::State(SpeechState::Listening), event_tx);
     let mut raw = vec![0u8; BLOCK_SAMPLES * 2];
     loop {
         // 停止命令优先检查（read 是阻塞点，块间隔 ~64ms 检查一次）。
@@ -758,16 +770,16 @@ fn run_listening_session(
             .collect();
         recognizer.accept_pcm16(SAMPLE_RATE as i32, &block);
 
-        let _ = event_tx.send(SpeechEvent::Partial(recognizer.partial_text()));
+        emit(SpeechEvent::Partial(recognizer.partial_text()), event_tx);
 
         // 停顿自动上屏：端点检测命中 → 当句提交、继续听下一句。
         if recognizer.is_endpoint() {
             let text = recognizer.partial_text();
             if !text.trim().is_empty() {
-                let _ = event_tx.send(SpeechEvent::Committed(text));
+                emit(SpeechEvent::Committed(text), event_tx);
             }
             recognizer.reset();
-            let _ = event_tx.send(SpeechEvent::Partial(String::new()));
+            emit(SpeechEvent::Partial(String::new()), event_tx);
         }
 
         std::thread::sleep(Duration::from_millis(1));
@@ -777,7 +789,7 @@ fn run_listening_session(
     drop(capture);
     let tail = recognizer.finalize();
     if !tail.trim().is_empty() {
-        let _ = event_tx.send(SpeechEvent::Committed(tail));
+        emit(SpeechEvent::Committed(tail), event_tx);
     }
     debug!("Speech capture stopped");
     Ok(())

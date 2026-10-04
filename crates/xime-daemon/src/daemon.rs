@@ -200,38 +200,38 @@ impl XimeDaemon {
         Ok(crate::speech::status_json())
     }
 
-    /// 下载语音模型（daemon 后台线程执行，进度在 GetSpeechStatus.download）。
-    async fn download_speech_model(&self, model_id: String) -> zbus::fdo::Result<()> {
+    // 语音操作方法全部返回**操作后的状态快照 JSON**——设置端回调签名是
+    // fn(id) -> Option<SpeechServerStatus>，返回空会让页面误报「服务未运行」；
+    // 顺带让页面一次往返拿到最新状态（下载进度/选择结果立即可见）。
+    async fn download_speech_model(&self, model_id: String) -> zbus::fdo::Result<String> {
         debug!("Received DownloadSpeechModel request: {model_id}");
         crate::speech::download_model(&model_id);
-        Ok(())
+        Ok(crate::speech::status_json())
     }
 
-    /// 删除语音模型目录（听写中的选中模型会被拒绝，错误进状态快照）。
-    async fn delete_speech_model(&self, model_id: String) -> zbus::fdo::Result<()> {
+    async fn delete_speech_model(&self, model_id: String) -> zbus::fdo::Result<String> {
         debug!("Received DeleteSpeechModel request: {model_id}");
         crate::speech::delete_model(&model_id);
-        Ok(())
+        Ok(crate::speech::status_json())
     }
 
-    /// 切换选中模型（持久化，下次听写会话生效）。
-    async fn select_speech_model(&self, model_id: String) -> zbus::fdo::Result<()> {
+    async fn select_speech_model(&self, model_id: String) -> zbus::fdo::Result<String> {
         debug!("Received SelectSpeechModel request: {model_id}");
         crate::speech::select_model(&model_id);
-        Ok(())
+        Ok(crate::speech::status_json())
     }
 
     /// 开始试听（与候选栏 🎙️ 同一条听写会话；识别文本进状态快照的 text）。
-    async fn speech_test_start(&self) -> zbus::fdo::Result<()> {
+    async fn speech_test_start(&self) -> zbus::fdo::Result<String> {
         debug!("Received SpeechTestStart request");
         crate::speech::test_start();
-        Ok(())
+        Ok(crate::speech::status_json())
     }
 
     /// 结束试听。
-    async fn speech_test_stop(&self) -> zbus::fdo::Result<()> {
+    async fn speech_test_stop(&self) -> zbus::fdo::Result<String> {
         debug!("Received SpeechTestStop request");
         crate::speech::test_stop();
-        Ok(())
+        Ok(crate::speech::status_json())
     }
 }

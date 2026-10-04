@@ -7,7 +7,7 @@ license = "GPL-3.0"
 repository.workspace = true
 
 [dependencies]
-xime-setup-lib = { workspace = true, features = ["clipboard-page", "dict-page", "backup-page"] }
+xime-setup-lib = { workspace = true, features = ["clipboard-page", "dict-page", "backup-page", "voice-page"] }
 iced = { version = "0.14", default-features = false, features = [
     "tokio",
     "wgpu",

@@ -1,10 +1,33 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**P10 语音转文本 M1 完成：🎙️ 菜单触发 → PulseAudio 采音 → sherpa 流式
-识别 → 停顿自动上屏；模型自动下载（已预置就绪）**（2026-10-04）。
-候选栏面板已按 XimeYao 完全重写并合入 main（上屏后清组合+隐藏候选栏、
-PANEL_GAP 分离式面板卡片、R/B 通道修复、SHM memfd）。
+**P10 语音转文本 M1+M2 完成：daemon 语音链路 + setup「语音转文本」页
+（模型下载/删除/切换/试听全在设置程序，候选栏只做未就绪引导）**
+（2026-10-04）。候选栏面板已按 XimeYao 完全重写并合入 main。
+
+## 本次变更（2026-10-04）：P10-M2 模型管理归位设置程序
+
+用户指正：候选栏 🎙️ 不该做模型下载——模型管理归 setup（扩展商店
+基建所在），候选栏未就绪时只提示引导。重构为「daemon 数据源 + setup
+镜像 UI」：
+- **speech.rs 全局化**：SpeechBridge 拆成全局 statics（CMD_TX/EVENT_RX/
+  VIEW），DBus 线程与 wayland 主循环共享；模型操作命令 DownloadModel/
+  DeleteModel/SelectModel（下载在独立线程，134MB 不阻塞 🎙️）；选中
+  模型持久化 ~/.config/xime/speech.json；**模型目录对齐 setup 的
+  models_dir 约定 ~/.config/xime/models**（已迁移已下载模型）
+- **候选栏去下载**：🎙️ 点击时模型未就绪 → 桌面通知「请打开设置程序的
+  「语音转文本」页下载」；SpeechState::Downloading/Shutdown 死代码清理
+- **DBus 新增 6 方法**：GetSpeechStatus（JSON 快照，字段逐字对齐
+  speech_models::SpeechServerStatus）/ DownloadSpeechModel /
+  DeleteSpeechModel / SelectSpeechModel / SpeechTestStart / SpeechTestStop
+- **libximecore**：voice 页解除 Windows 门控（voice-page feature 即可；
+  WinRT 听写保持 windows 双门）；SpeechServerStatus/Entry 补
+  Deserialize；**librime-sys2 rpath 合并单条**（lld 下多条 -rpath 互相
+  覆盖——曾致 daemon 链接系统 librime 启动崩溃，含 $ORIGIN 语音库位）
+- **xime-setup 薄壳**：voice-page feature + 6 个语音回调注入（zbus
+  blocking → daemon DBus，对齐现有 fn 指针模式）
+- **验证**：GetSpeechStatus 快照（model_ready 命中）、未下载模型选择
+  被拒、speech.json 持久化往返；194+25 tests / 两仓 clippy 全绿
 
 ## 本次变更（2026-10-04）：P10-M1 语音转文本核心链路
 

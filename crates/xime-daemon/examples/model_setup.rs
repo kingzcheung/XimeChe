@@ -2,10 +2,16 @@
 fn main() {
     let profile = xime_speech::AsrModelRegistry::default_profile();
     println!("模型: {} ({})", profile.name, profile.size);
-    let dir = std::path::Path::new(&std::env::var("HOME").unwrap()).join(format!(".local/share/xime/models/{}", profile.id));
+    let dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+        .join(format!(".local/share/xime/models/{}", profile.id));
     let ready = [
-        &profile.encoder_file, &profile.decoder_file, &profile.joiner_file, &profile.tokens_file,
-    ].iter().all(|f| dir.join(f).is_file());
+        &profile.encoder_file,
+        &profile.decoder_file,
+        &profile.joiner_file,
+        &profile.tokens_file,
+    ]
+    .iter()
+    .all(|f| dir.join(f).is_file());
     if ready {
         println!("模型已就绪: {}", dir.display());
         return;
@@ -26,7 +32,9 @@ fn main() {
     let mut buf = [0u8; 256 * 1024];
     loop {
         let n = resp.read(&mut buf).unwrap();
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         file.write_all(&buf[..n]).unwrap();
         downloaded += n as u64;
         if total > 0 && downloaded % (8 * 1024 * 1024) < buf.len() as u64 {
@@ -37,15 +45,23 @@ fn main() {
     let bz = bzip2::read::BzDecoder::new(std::fs::File::open(&archive).unwrap());
     let work = dir.join("_extract");
     tar::Archive::new(bz).unpack(&work).unwrap();
-    for name in [&profile.encoder_file, &profile.decoder_file, &profile.joiner_file, &profile.tokens_file] {
+    for name in [
+        &profile.encoder_file,
+        &profile.decoder_file,
+        &profile.joiner_file,
+        &profile.tokens_file,
+    ] {
         // 递归找
         fn find(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
             let mut stack = vec![root.to_path_buf()];
             while let Some(d) = stack.pop() {
                 for e in std::fs::read_dir(&d).unwrap() {
                     let p = e.unwrap().path();
-                    if p.is_dir() { stack.push(p); }
-                    else if p.file_name().is_some_and(|n| n == name) { return Some(p); }
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.file_name().is_some_and(|n| n == name) {
+                        return Some(p);
+                    }
                 }
             }
             None

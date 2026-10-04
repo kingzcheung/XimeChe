@@ -190,7 +190,48 @@ impl XimeDaemon {
             Ok(read) => {
                 serde_json::to_string(&read).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
             }
-            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+            Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
+    }
+
+    /// 语音状态快照（设置程序「语音转文本」页 250ms 轮询；JSON 结构对齐
+    /// libximecore speech_models 的 SpeechServerStatus，设置端反序列化）。
+    async fn get_speech_status(&self) -> zbus::fdo::Result<String> {
+        Ok(crate::speech::status_json())
+    }
+
+    /// 下载语音模型（daemon 后台线程执行，进度在 GetSpeechStatus.download）。
+    async fn download_speech_model(&self, model_id: String) -> zbus::fdo::Result<()> {
+        debug!("Received DownloadSpeechModel request: {model_id}");
+        crate::speech::download_model(&model_id);
+        Ok(())
+    }
+
+    /// 删除语音模型目录（听写中的选中模型会被拒绝，错误进状态快照）。
+    async fn delete_speech_model(&self, model_id: String) -> zbus::fdo::Result<()> {
+        debug!("Received DeleteSpeechModel request: {model_id}");
+        crate::speech::delete_model(&model_id);
+        Ok(())
+    }
+
+    /// 切换选中模型（持久化，下次听写会话生效）。
+    async fn select_speech_model(&self, model_id: String) -> zbus::fdo::Result<()> {
+        debug!("Received SelectSpeechModel request: {model_id}");
+        crate::speech::select_model(&model_id);
+        Ok(())
+    }
+
+    /// 开始试听（与候选栏 🎙️ 同一条听写会话；识别文本进状态快照的 text）。
+    async fn speech_test_start(&self) -> zbus::fdo::Result<()> {
+        debug!("Received SpeechTestStart request");
+        crate::speech::test_start();
+        Ok(())
+    }
+
+    /// 结束试听。
+    async fn speech_test_stop(&self) -> zbus::fdo::Result<()> {
+        debug!("Received SpeechTestStop request");
+        crate::speech::test_stop();
+        Ok(())
     }
 }

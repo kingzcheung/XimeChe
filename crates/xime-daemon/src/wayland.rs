@@ -140,8 +140,6 @@ pub struct WaylandLoop {
     clipboard: Arc<ClipboardStore>,
     /// 剪贴板同步桥命令通道。
     sync_tx: std::sync::mpsc::Sender<SyncMessage>,
-    /// 语音听写会话桥（P10：🎙️ 触发 → 事件回主循环上屏）。
-    speech: crate::speech::SpeechBridge,
 }
 
 impl WaylandLoop {
@@ -159,12 +157,12 @@ impl WaylandLoop {
             candidate_cache: std::sync::Mutex::new(None),
             clipboard,
             sync_tx,
-            speech: crate::speech::SpeechBridge::spawn(),
         }
     }
 
     pub fn run(self) {
         info!("Wayland loop thread started");
+        crate::speech::init();
 
         let mut conn: Option<Box<dyn ImBackend>> = None;
         let mut xkb: Option<XkbContext> = None;
@@ -395,8 +393,8 @@ impl WaylandLoop {
                         consumed_presses.clear();
                         // 听写中失焦：停止会话（剩余文本经 finalize 迟到上屏，
                         // 没有焦点的窗口上继续录音没有意义）。
-                        if self.speech.state() != crate::speech::SpeechState::Idle {
-                            self.speech.toggle();
+                        if crate::speech::state() != crate::speech::SpeechState::Idle {
+                            crate::speech::toggle();
                         }
                         continue;
                     }
@@ -497,7 +495,7 @@ impl WaylandLoop {
         }
 
         // 语音听写事件：上屏 / 候选栏实时反馈（worker 在后台线程，主循环只消费）。
-        self.speech.drain_events(|event| {
+        crate::speech::drain_events(|event| {
             self.handle_speech_event(c, plugin_host, event, theme, candidate_window_visible);
         });
 
@@ -1098,7 +1096,7 @@ impl WaylandLoop {
             }
             Ev::Partial(text) => {
                 // 听写中的实时反馈：候选栏显示 partial（空文本显示占位）。
-                if !matches!(self.speech.state(), SpeechState::Listening) {
+                if !matches!(crate::speech::state(), SpeechState::Listening) {
                     return;
                 }
                 let display = if text.trim().is_empty() {
@@ -1118,16 +1116,6 @@ impl WaylandLoop {
                 *candidate_window_visible = true;
             }
             Ev::State(state) => match state {
-                SpeechState::Downloading(p) => {
-                    let candidates = vec![xime_ui::CandidateItem {
-                        text: format!("🎙️ 正在下载语音模型…{:.0}%", p * 100.0),
-                        comment: String::new(),
-                        index: 0,
-                    }];
-                    let _ = c.show_candidate_window(&candidates, 0, theme);
-                    let _ = c.flush();
-                    *candidate_window_visible = true;
-                }
                 SpeechState::Loading => {
                     let candidates = vec![xime_ui::CandidateItem {
                         text: "🎙️ 正在装载语音引擎…".to_string(),
@@ -1181,8 +1169,8 @@ impl WaylandLoop {
         // 候选栏区域：菜单按钮开合。听写中点它 = 停止听写（🎙️ 结束入口）。
         if pe.y < bar as i32 {
             if xime_ui::menu_button_hit(pe.x, pe.y, *last_panel_width, bar) {
-                if self.speech.state() == crate::speech::SpeechState::Listening {
-                    self.speech.toggle();
+                if crate::speech::state() == crate::speech::SpeechState::Listening {
+                    crate::speech::toggle();
                     return;
                 }
                 match panel_state {
@@ -1231,7 +1219,7 @@ impl WaylandLoop {
                     // 语音输入：切换听写会话（开始/停止），面板收起让位给
                     // 候选栏上的实时反馈（下载/装载/听写中的 partial 文本）。
                     xime_ui::menu::MenuCard::VoiceInput => {
-                        self.speech.toggle();
+                        crate::speech::toggle();
                         self.close_panel(c, panel, panel_state, theme, candidate_window_visible);
                         None
                     }

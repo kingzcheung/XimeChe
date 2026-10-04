@@ -7,8 +7,8 @@ fn main() {
         .join(format!(".local/share/xime/models/{}", profile.id));
     println!("装载模型 {} …", profile.id);
     let start = std::time::Instant::now();
-    let mut rec = StreamingRecognizer::open(&profile, &dir, &SpeechConfig::default())
-        .expect("模型装载");
+    let mut rec =
+        StreamingRecognizer::open(&profile, &dir, &SpeechConfig::default()).expect("模型装载");
     println!("装载完成（{:?}），开始采集 4 秒，请说话…", start.elapsed());
 
     // 复用 daemon 的 PulseCapture（dlopen libpulse-simple）

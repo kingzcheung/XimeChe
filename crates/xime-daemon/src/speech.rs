@@ -1,22 +1,26 @@
-//! 语音听写（P10-M1：核心链路）。
+//! 语音听写（P10：核心链路 + 设置页数据源）。
 //!
 //! 分工（对齐 xime-speech 的设计注释）：纯推理在 [`xime_speech`]（sherpa-onnx
-//! 流式 zipformer，端点检测内建）；本模块负责宿主侧三件事——
+//! 流式 zipformer，端点检测内建）；本模块负责宿主侧四件事——
 //!
-//! 1. **模型管理**：首次使用自动从 ModelScope 下载 tar.bz2 → 解压 → 校验四
-//!    文件，落 `~/.local/share/xime/models/<id>/`；
-//! 2. **音频采集**：PulseAudio 简单 API（16kHz 单声道 s16le；KDE 的
-//!    PipeWire 经 pipewire-pulse 兼容此 API），`dynamic` 特性运行时 dlopen，
-//!    构建不依赖 libpulse-dev；
-//! 3. **会话线程**：单个 worker 独占 [`StreamingRecognizer`]（非 Send 共享
-//!    语义），命令进 / 事件出的信箱模式——daemon 主循环只消费事件做
-//!    上屏与候选栏反馈，识别/下载/解压都不碰主线程（UI 冻结纪律）。
+//! 1. **模型管理（daemon 是权威数据源）**：下载（ModelScope tar.bz2）、删除、
+//!    选中（持久化 `~/.config/xime/speech.json`）都由本模块执行；目录
+//!    `~/.config/xime/models/<id>/` 与设置程序 models_dir 同一约定。候选栏
+//!    🎙️ 不做下载——未就绪时提示用户去设置程序「语音转文本」页处理；
+//! 2. **状态快照**：[`status_json`] 组装设置页轮询的全部数据（引擎状态 +
+//!    模型列表 + 下载进度），DBus `GetSpeechStatus` 直读；
+//! 3. **音频采集**：PulseAudio 简单 API（16kHz 单声道 s16ne；KDE 的
+//!    PipeWire 经 pipewire-pulse 兼容），dlopen 运行时绑定，构建零依赖；
+//! 4. **会话线程**：单个 worker 独占 [`StreamingRecognizer`]（非 Send 共享
+//!    语义），命令进 / 事件出；主循环只消费事件做上屏与候选栏反馈。
 //!
 //! 交互（对齐 XimeYao 设置页说明的设计意图）：点候选栏 🎙️ 开始听写，
 //! 停顿时自动上屏（端点检测断句），再点 🎙️ 结束。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tracing::{debug, error, info};
@@ -75,7 +79,7 @@ impl PulseCapture {
             let read_fn: libloading::Symbol<PaSimpleRead> = lib
                 .get(b"pa_simple_read")
                 .map_err(|e| format!("libpulse-simple 缺少 pa_simple_read：{e}"))?;
-            let free_fn: libloading::Symbol<PaSimpleFree> =
+            let _free_fn: libloading::Symbol<PaSimpleFree> =
                 lib.get(b"pa_simple_free").map_err(|e| format!("{e}"))?;
 
             let spec = PaSampleSpec {
@@ -98,9 +102,8 @@ impl PulseCapture {
             if handle.is_null() {
                 return Err("麦克风打开失败：请检查输入设备与 pipewire-pulse 服务".into());
             }
-            // Symbol 借用 lib；把函数指针拷出来后 lib 一起存进结构体。
+            // Symbol 借用 lib；函数指针拷出后 lib 一起存进结构体。
             let read_fn: PaSimpleRead = *read_fn;
-            let _ = free_fn;
             Ok(Self {
                 _lib: lib,
                 handle,
@@ -132,13 +135,19 @@ impl Drop for PulseCapture {
     }
 }
 
+// ── 命令 / 事件 ─────────────────────────────────────────────────────
+
 /// 发给 worker 的命令。
 #[derive(Debug)]
 pub enum SpeechCommand {
-    /// 🎙️ 点击：Idle → 开始（无模型先下载）；Listening → 结束上屏。
+    /// 🎙️ 点击：Idle → 开始听写；Listening → 结束上屏。
     Toggle,
-    /// daemon 退出：停采集、结束线程。
-    Shutdown,
+    /// 设置页请求下载模型（独立线程执行，进度经事件回）。
+    DownloadModel(String),
+    /// 设置页请求删除模型目录（听写中且是选中模型时拒绝）。
+    DeleteModel(String),
+    /// 设置页切换选中模型（持久化 + 下次会话生效）。
+    SelectModel(String),
 }
 
 /// worker 发给主循环的事件（主循环负责上屏 / 候选栏反馈 / 桌面通知）。
@@ -150,7 +159,7 @@ pub enum SpeechEvent {
     Partial(String),
     /// 一句识别完成（端点断句或停止收尾），主循环 commit_string 上屏。
     Committed(String),
-    /// 失败（下载/装载/采集），文案已面向用户。
+    /// 失败（模型未就绪/装载/采集），文案已面向用户。
     Error(String),
 }
 
@@ -158,11 +167,20 @@ pub enum SpeechEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpeechState {
     Idle,
-    /// 模型下载进度 0.0~1.0。
-    Downloading(f32),
     /// 模型装载中（首次 ~秒级）。
     Loading,
     Listening,
+}
+
+impl SpeechState {
+    /// 设置页状态字符串（对齐 SpeechServerStatus.state 语义）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SpeechState::Idle => "idle",
+            SpeechState::Loading => "loading",
+            SpeechState::Listening => "listening",
+        }
+    }
 }
 
 /// 采集参数：16kHz 单声道，每块 1024 样本 ≈ 64ms。
@@ -170,10 +188,50 @@ const SAMPLE_RATE: u32 = 16_000;
 const CHANNELS: u16 = 1;
 const BLOCK_SAMPLES: usize = 1024;
 
-/// 模型数据根（对齐 XimeChe 数据目录约定：rime-data 同在 ~/.local/share/xime）。
+/// 选中模型持久化（会话开始时读取；测试重定向，与 recent_usage 同一教训）。
+fn speech_config_path() -> PathBuf {
+    #[cfg(test)]
+    let path = std::env::temp_dir().join(format!(
+        "xime-speech-config-test-{}.json",
+        std::process::id()
+    ));
+    #[cfg(not(test))]
+    let path = {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        Path::new(&home)
+            .join(".config")
+            .join(xime_config::app_metadata().config_dir_name)
+            .join("speech.json")
+    };
+    path
+}
+
+/// 读选中的模型 id（未设置/损坏 = 空串 → 会话回退默认模型）。
+fn read_selected_id() -> String {
+    std::fs::read_to_string(speech_config_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// 持久化选中的模型 id。
+fn write_selected_id(id: &str) -> anyhow::Result<()> {
+    let path = speech_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::json!({ "model": id }).to_string())?;
+    Ok(())
+}
+
+/// 模型数据根（与设置程序 models_dir 同一约定：~/.config/xime/models）。
 fn models_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    Path::new(&home).join(".local/share/xime/models")
+    Path::new(&home)
+        .join(".config")
+        .join(xime_config::app_metadata().config_dir_name)
+        .join("models")
 }
 
 #[cfg(test)]
@@ -295,8 +353,12 @@ fn find_file_recursive(root: &Path, name: &str) -> anyhow::Result<Option<PathBuf
 }
 
 /// 下载 + 解压 + 校验，返回就绪的模型目录。
-fn ensure_model(profile: &AsrModelProfile, on_progress: &dyn Fn(f32)) -> anyhow::Result<PathBuf> {
-    let dir = models_root().join(&profile.id);
+fn ensure_model(
+    profile: &AsrModelProfile,
+    root: &Path,
+    on_progress: &dyn Fn(f32),
+) -> anyhow::Result<PathBuf> {
+    let dir = root.join(&profile.id);
     if is_model_ready(profile, &dir) {
         return Ok(dir);
     }
@@ -319,117 +381,227 @@ fn ensure_model(profile: &AsrModelProfile, on_progress: &dyn Fn(f32)) -> anyhow:
     Ok(dir)
 }
 
-/// 会话桥：daemon 主循环持有（发命令 + 轮询事件）。
-///
-/// 全部方法 `&self`（daemon 的各事件处理器都是不可变借用），内部可变性：
-/// 命令通道与状态缓存用 Mutex，事件接收端 `try_recv` 本身就是 `&self`。
-pub struct SpeechBridge {
-    cmd_tx: std::sync::Mutex<Option<Sender<SpeechCommand>>>,
-    event_rx: Receiver<SpeechEvent>,
-    /// 主循环侧缓存的（状态，最新 partial）。
-    view: std::sync::Mutex<(SpeechState, String)>,
+// ── 全局桥（DBus 线程与 wayland 主循环共享）─────────────────────────
+
+/// daemon 内部状态视图（worker/下载线程是写者，DBus/主循环是读者）。
+#[derive(Default)]
+struct SpeechView {
+    state: Option<SpeechState>,
+    /// 听写中的 partial / 最近一次识别文本（试听回显）。
+    text: String,
+    last_error: Option<String>,
+    /// 正在下载的模型与进度（设置页进度条）。
+    download: Option<(String, f32)>,
+    selected_id: String,
 }
 
-impl SpeechBridge {
-    /// 启动 worker 线程（进程生命周期内常驻）。
-    pub fn spawn() -> Self {
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SpeechCommand>();
-        let (event_tx, event_rx) = std::sync::mpsc::channel::<SpeechEvent>();
-        std::thread::Builder::new()
-            .name("xime-speech".into())
-            .spawn(move || worker_loop(cmd_rx, event_tx))
-            .expect("spawn speech worker");
-        Self {
-            cmd_tx: std::sync::Mutex::new(Some(cmd_tx)),
-            event_rx,
-            view: std::sync::Mutex::new((SpeechState::Idle, String::new())),
-        }
-    }
+static CMD_TX: OnceLock<Sender<SpeechCommand>> = OnceLock::new();
+static EVENT_RX: OnceLock<Mutex<Receiver<SpeechEvent>>> = OnceLock::new();
+static VIEW: OnceLock<Mutex<SpeechView>> = OnceLock::new();
+/// 模型集合变化计数（下载/删除完成的独立线程也能原子自增）。
+static MODELS_REV: AtomicU64 = AtomicU64::new(0);
 
-    /// 🎙️ 切换（不阻塞，结果经事件回）。
-    pub fn toggle(&self) {
-        let mut slot = self.cmd_tx.lock().unwrap_or_else(|p| p.into_inner());
-        match slot.as_ref() {
-            Some(tx) => {
-                if tx.send(SpeechCommand::Toggle).is_err() {
-                    error!("speech worker gone");
-                    *slot = None;
-                }
+fn view() -> &'static Mutex<SpeechView> {
+    VIEW.get_or_init(|| Mutex::new(SpeechView::default()))
+}
+
+/// 启动 worker 线程（daemon 启动时调用一次）。
+pub fn init() {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SpeechCommand>();
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<SpeechEvent>();
+    std::thread::Builder::new()
+        .name("xime-speech".into())
+        .spawn(move || worker_loop(cmd_rx, event_tx))
+        .expect("spawn speech worker");
+    let _ = CMD_TX.set(cmd_tx);
+    let _ = EVENT_RX.set(Mutex::new(event_rx));
+    let selected = read_selected_id();
+    view().lock().unwrap_or_else(|p| p.into_inner()).selected_id = selected;
+    info!("Speech bridge initialized");
+}
+
+fn send_cmd(cmd: SpeechCommand) {
+    match CMD_TX.get() {
+        Some(tx) => {
+            if tx.send(cmd).is_err() {
+                error!("speech worker gone");
             }
-            None => error!("speech worker already stopped"),
         }
+        None => error!("speech bridge not initialized"),
     }
+}
 
-    /// 主循环每轮拉取事件（副作用：上屏/候选栏/通知都在调用方做）。
-    pub fn drain_events(&self, mut on_event: impl FnMut(SpeechEvent)) {
-        let mut view = self.view.lock().unwrap_or_else(|p| p.into_inner());
-        loop {
-            match self.event_rx.try_recv() {
-                Ok(event) => {
+/// 🎙️ 切换（不阻塞，结果经事件回）。
+pub fn toggle() {
+    send_cmd(SpeechCommand::Toggle);
+}
+
+/// 设置页请求下载模型（独立线程执行，进度写视图）。
+pub fn download_model(id: &str) {
+    send_cmd(SpeechCommand::DownloadModel(id.to_string()));
+}
+
+/// 设置页请求删除模型。
+pub fn delete_model(id: &str) {
+    send_cmd(SpeechCommand::DeleteModel(id.to_string()));
+}
+
+/// 设置页切换选中模型（持久化，下次会话生效）。
+pub fn select_model(id: &str) {
+    send_cmd(SpeechCommand::SelectModel(id.to_string()));
+}
+
+/// 设置页请求开始试听（= 候选栏 🎙️ 同一条会话）。
+pub fn test_start() {
+    toggle();
+}
+
+pub fn test_stop() {
+    toggle();
+}
+
+/// 主循环每轮拉取事件（副作用：上屏/候选栏/通知都在调用方做）。
+/// 同时把状态写进视图（DBus 状态快照的权威来源）。
+pub fn drain_events(mut on_event: impl FnMut(SpeechEvent)) {
+    let Some(rx) = EVENT_RX.get() else {
+        return;
+    };
+    let rx = rx.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        match rx.try_recv() {
+            Ok(event) => {
+                {
+                    let mut view = view().lock().unwrap_or_else(|p| p.into_inner());
                     match &event {
                         SpeechEvent::State(state) => {
-                            view.0 = state.clone();
+                            view.state = Some(state.clone());
                             if *state != SpeechState::Listening {
-                                view.1.clear();
+                                view.text.clear();
                             }
                         }
-                        SpeechEvent::Partial(text) => view.1 = text.clone(),
-                        _ => {}
+                        SpeechEvent::Partial(text) => view.text = text.clone(),
+                        SpeechEvent::Committed(text) => view.text = text.clone(),
+                        SpeechEvent::Error(e) => {
+                            view.last_error = Some(e.clone());
+                            view.download = None;
+                        }
                     }
-                    on_event(event);
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    *self.cmd_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                    break;
-                }
+                on_event(event);
             }
-        }
-    }
-
-    pub fn state(&self) -> SpeechState {
-        self.view
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .0
-            .clone()
-    }
-
-    #[allow(dead_code)]
-    pub fn partial(&self) -> String {
-        self.view
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .1
-            .clone()
-    }
-
-    /// daemon 退出时停线程（退出路径上没有恢复手段，错误忽略）。
-    pub fn shutdown(&self) {
-        let mut slot = self.cmd_tx.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(tx) = slot.take() {
-            let _ = tx.send(SpeechCommand::Shutdown);
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => break,
         }
     }
 }
 
-impl Drop for SpeechBridge {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
+/// 当前引擎状态（候选栏 🎙️ 决策用）。
+pub fn state() -> SpeechState {
+    view()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .state
+        .clone()
+        .unwrap_or(SpeechState::Idle)
 }
 
-/// worker 主循环：Idle 时阻塞等命令；一次 Toggle 跑完整场听写会话。
+// ── 设置页状态快照（DBus GetSpeechStatus 的载荷）────────────────────
+
+/// 一个可管理模型的 JSON 镜像（字段名与 libximecore speech_models 的
+/// SpeechModelEntry 逐字对齐，设置端 serde 反序列化）。
+#[derive(serde::Serialize)]
+struct SpeechModelJson {
+    id: String,
+    name: String,
+    description: String,
+    size: String,
+    downloaded: bool,
+    selected: bool,
+    recommended: bool,
+}
+
+/// 引擎状态快照（字段名与 SpeechServerStatus 逐字对齐）。
+#[derive(serde::Serialize)]
+struct SpeechStatusJson {
+    state: String,
+    model_id: String,
+    model_name: String,
+    model_ready: bool,
+    provider: String,
+    text: String,
+    error: Option<String>,
+    download: Option<(String, f32)>,
+    models_rev: u64,
+    models: Vec<SpeechModelJson>,
+}
+
+/// 组装设置页轮询快照（DBus GetSpeechStatus 直读；纯文件系统 + 内存视图）。
+pub fn status_json() -> String {
+    let view = view().lock().unwrap_or_else(|p| p.into_inner());
+    let selected_id = if view.selected_id.is_empty() {
+        AsrModelRegistry::default_profile().id
+    } else {
+        view.selected_id.clone()
+    };
+    let root = models_root();
+    let models: Vec<SpeechModelJson> = AsrModelRegistry::profiles()
+        .iter()
+        .map(|p| SpeechModelJson {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            description: p.description.clone(),
+            size: p.size.clone(),
+            downloaded: is_model_ready(p, &root.join(&p.id)),
+            selected: p.id == selected_id,
+            recommended: p.id == AsrModelRegistry::recommended_id(),
+        })
+        .collect();
+    let default_profile = AsrModelRegistry::default_profile();
+    let model_ready = is_model_ready(&default_profile, &root.join(&selected_id));
+    let state = view.state.clone().unwrap_or(SpeechState::Idle);
+    let status = SpeechStatusJson {
+        state: state.as_str().to_string(),
+        model_id: selected_id.clone(),
+        model_name: AsrModelRegistry::profile_or_default(&selected_id).name,
+        model_ready: if selected_id == default_profile.id {
+            is_model_ready(&default_profile, &root.join(&default_profile.id))
+        } else {
+            model_ready
+        },
+        provider: format!("cpu（{} 线程）", SpeechConfig::default().num_threads),
+        text: view.text.clone(),
+        error: view.last_error.clone(),
+        download: view.download.clone(),
+        models_rev: MODELS_REV.load(Ordering::Relaxed),
+        models,
+    };
+    serde_json::to_string(&status).unwrap_or_default()
+}
+
+// ── worker ──────────────────────────────────────────────────────────
+
+/// worker 主循环：Idle 时阻塞等命令；下载/删除/选择即时处理，
+/// Toggle 跑完整场听写会话。
 fn worker_loop(cmd_rx: Receiver<SpeechCommand>, event_tx: Sender<SpeechEvent>) {
-    let profile = AsrModelRegistry::default_profile();
     loop {
-        // 等下一条命令（空闲时不占 CPU）。
         let Ok(cmd) = cmd_rx.recv() else {
             return; // 主循环退出
         };
         match cmd {
-            SpeechCommand::Shutdown => return,
             SpeechCommand::Toggle => {
+                // 会话内命令由 run_listening_session 的循环消费；
+                // 这里先清掉滞留命令，避免误停。
+                while cmd_rx.try_recv().is_ok() {}
+                let selected = read_selected_id();
+                let profile = AsrModelRegistry::profile_or_default(&selected);
+                let dir = models_root().join(&profile.id);
+                if !is_model_ready(&profile, &dir) {
+                    // 引导去设置程序（候选栏 🎙️ 不做下载）。
+                    let _ = event_tx.send(SpeechEvent::Error(
+                        "语音模型未下载，请打开设置程序的「语音转文本」页下载".into(),
+                    ));
+                    continue;
+                }
                 let _ = event_tx.send(SpeechEvent::State(SpeechState::Loading));
                 match run_listening_session(&profile, &cmd_rx, &event_tx) {
                     Ok(()) => info!("Speech session ended normally"),
@@ -440,35 +612,122 @@ fn worker_loop(cmd_rx: Receiver<SpeechCommand>, event_tx: Sender<SpeechEvent>) {
                 }
                 let _ = event_tx.send(SpeechEvent::State(SpeechState::Idle));
             }
+            SpeechCommand::DownloadModel(id) => {
+                download_model_async(&id, event_tx.clone());
+            }
+            SpeechCommand::DeleteModel(id) => {
+                handle_delete_model(&id, event_tx.clone());
+            }
+            SpeechCommand::SelectModel(id) => {
+                handle_select_model(&id, event_tx.clone());
+            }
         }
     }
 }
 
-/// 一次听写会话：确保模型 → 装载 → 采集识别 → Stop 收尾。
-/// 返回 Ok 表示正常结束（含用户主动停止）；Err 为可告知用户的失败。
+/// 下载在独立线程执行：134MB 期间 Toggle/其他操作不被阻塞。
+/// 进度直接写视图（DBus 轮询可见），完成/失败发事件刷新。
+fn download_model_async(id: &str, _event_tx: Sender<SpeechEvent>) {
+    let id = id.to_string();
+    let profile = AsrModelRegistry::profile_or_default(&id);
+    // 已就绪 / 已在下载：不重复。
+    {
+        let view = view().lock().unwrap_or_else(|p| p.into_inner());
+        if is_model_ready(&profile, &models_root().join(&profile.id))
+            || matches!(&view.download, Some((downloading, _)) if *downloading == profile.id)
+        {
+            return;
+        }
+    }
+    std::thread::Builder::new()
+        .name("xime-speech-download".into())
+        .spawn(move || {
+            {
+                let mut view = view().lock().unwrap_or_else(|p| p.into_inner());
+                view.download = Some((profile.id.clone(), 0.0));
+                view.last_error = None;
+            }
+            let result = ensure_model(&profile, &models_root(), &|p: f32| {
+                let mut view = view().lock().unwrap_or_else(|p| p.into_inner());
+                view.download = Some((profile.id.clone(), p));
+            });
+            match result {
+                Ok(_) => {
+                    MODELS_REV.fetch_add(1, Ordering::Relaxed);
+                    let mut view = view().lock().unwrap_or_else(|p| p.into_inner());
+                    view.download = None;
+                    info!("Model '{}' download finished", profile.id);
+                }
+                Err(e) => {
+                    error!("Model '{}' download failed: {e:#}", profile.id);
+                    let mut view = view().lock().unwrap_or_else(|p| p.into_inner());
+                    view.download = None;
+                    view.last_error = Some(format!("模型「{}」下载失败：{e:#}", profile.name));
+                }
+            }
+        })
+        .expect("spawn speech download");
+}
+
+/// 删除模型目录；听写中的选中模型拒绝（会话正占着推理器）。
+fn handle_delete_model(id: &str, event_tx: Sender<SpeechEvent>) {
+    let selected = read_selected_id();
+    if id == selected && state() == SpeechState::Listening {
+        let _ = event_tx.send(SpeechEvent::Error(
+            "正在使用该模型听写，先停止后再删除".into(),
+        ));
+        return;
+    }
+    let dir = models_root().join(id);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            MODELS_REV.fetch_add(1, Ordering::Relaxed);
+            info!("Model '{id}' deleted");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 本来就没装：视为成功（设置页状态会刷新）。
+            MODELS_REV.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            let _ = event_tx.send(SpeechEvent::Error(format!("删除模型失败：{e}")));
+        }
+    }
+}
+
+/// 切换选中模型：持久化；听写中的切换在下次会话生效。
+fn handle_select_model(id: &str, event_tx: Sender<SpeechEvent>) {
+    let profile = AsrModelRegistry::profile_or_default(id);
+    if !is_model_ready(&profile, &models_root().join(&profile.id)) {
+        let _ = event_tx.send(SpeechEvent::Error(format!(
+            "模型「{}」未下载，先下载再选择",
+            profile.name
+        )));
+        return;
+    }
+    match write_selected_id(id) {
+        Ok(()) => {
+            view().lock().unwrap_or_else(|p| p.into_inner()).selected_id = id.to_string();
+            info!("Speech model selected: {id}");
+        }
+        Err(e) => {
+            let _ = event_tx.send(SpeechEvent::Error(format!("保存模型选择失败：{e}")));
+        }
+    }
+}
+
+/// 一次听写会话：装载（模型必须已就绪，worker 已挡）→ 采集识别 → Stop 收尾。
 fn run_listening_session(
     profile: &AsrModelProfile,
     cmd_rx: &Receiver<SpeechCommand>,
     event_tx: &Sender<SpeechEvent>,
 ) -> anyhow::Result<()> {
-    // 1. 模型就绪（下载进度上报；已在则直接用）。
-    let dir = {
-        let dir = models_root().join(&profile.id);
-        if is_model_ready(profile, &dir) {
-            dir
-        } else {
-            let _ = event_tx.send(SpeechEvent::State(SpeechState::Downloading(0.0)));
-            ensure_model(profile, &|p: f32| {
-                let _ = event_tx.send(SpeechEvent::State(SpeechState::Downloading(p)));
-            })?
-        }
-    };
+    let dir = models_root().join(&profile.id);
 
-    // 2. 装载（首次秒级）。
+    // 装载（首次秒级）。
     let mut recognizer = StreamingRecognizer::open(profile, &dir, &SpeechConfig::default())
         .map_err(|e| anyhow::anyhow!("语音引擎装载失败：{e:?}"))?;
 
-    // 3. 采集（PulseAudio simple record：16k mono s16ne，dlopen 运行时绑定）。
+    // 采集（PulseAudio simple record：16k mono s16ne，dlopen 运行时绑定）。
     let mut capture = PulseCapture::new().map_err(|e| anyhow::anyhow!(e))?;
 
     let _ = event_tx.send(SpeechEvent::State(SpeechState::Listening));
@@ -476,9 +735,17 @@ fn run_listening_session(
     loop {
         // 停止命令优先检查（read 是阻塞点，块间隔 ~64ms 检查一次）。
         match cmd_rx.try_recv() {
-            Ok(SpeechCommand::Toggle | SpeechCommand::Shutdown) => break,
+            Ok(SpeechCommand::Toggle) => break,
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => break,
+            // 会话内的模型管理命令同样视为停止信号（听写优先让位）。
+            Ok(
+                SpeechCommand::DownloadModel(_)
+                | SpeechCommand::DeleteModel(_)
+                | SpeechCommand::SelectModel(_),
+            ) => {
+                break;
+            }
         }
 
         capture.read(&mut raw).map_err(|e| anyhow::anyhow!(e))?;
@@ -506,7 +773,7 @@ fn run_listening_session(
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    // 4. 收尾：finalize 冲出未断句的尾巴。
+    // 收尾：finalize 冲出未断句的尾巴。
     drop(capture);
     let tail = recognizer.finalize();
     if !tail.trim().is_empty() {
@@ -523,7 +790,6 @@ mod tests {
     #[test]
     fn default_profile_files_check_shape() {
         let profile = AsrModelRegistry::default_profile();
-        // 四个角色文件名非空（is_model_ready 的契约）。
         assert!(!profile.encoder_file.is_empty());
         assert!(!profile.tokens_file.is_empty());
     }
@@ -540,10 +806,46 @@ mod tests {
     }
 
     #[test]
-    fn bridge_starts_idle_and_drains() {
-        let bridge = SpeechBridge::spawn();
-        assert_eq!(bridge.state(), SpeechState::Idle);
-        bridge.drain_events(|_| {}); // 无事件不 panic
-        bridge.shutdown();
+    fn selected_id_persists_roundtrip() {
+        write_selected_id("zipformer-zh-int8").unwrap();
+        assert_eq!(read_selected_id(), "zipformer-zh-int8");
+        std::fs::remove_file(speech_config_path()).ok();
+    }
+
+    #[test]
+    fn status_json_shape_matches_setup_mirror() {
+        // 字段名必须与 libximecore speech_models 的 SpeechServerStatus /
+        // SpeechModelEntry 逐字对齐（设置端 serde 反序列化依赖）。
+        let json = status_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for key in [
+            "state",
+            "model_id",
+            "model_name",
+            "model_ready",
+            "provider",
+            "text",
+            "error",
+            "download",
+            "models_rev",
+            "models",
+        ] {
+            assert!(v.get(key).is_some(), "缺少字段 {key}");
+        }
+        if let Some(models) = v.get("models").and_then(|m| m.as_array()) {
+            if let Some(first) = models.first() {
+                for key in [
+                    "id",
+                    "name",
+                    "description",
+                    "size",
+                    "downloaded",
+                    "selected",
+                    "recommended",
+                ] {
+                    assert!(first.get(key).is_some(), "models[] 缺少字段 {key}");
+                }
+            }
+        }
     }
 }

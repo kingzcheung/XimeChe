@@ -419,6 +419,17 @@ impl WaylandLoop {
                 }
                 Ok(DaemonCommand::Deploy) => {
                     debug!("Deploy command received, starting Rime deployment...");
+
+                    // 与托盘左键同一套恢复逻辑：KWin 在切换窗口后不再重算
+                    // IM 激活态（refreshActive 只由客户端 text-input
+                    // enable/disable 触发），IM 未激活时按键根本不经过 daemon，
+                    // 此时"重新部署"只能靠菜单抢焦点这一副作用恢复。这里显式
+                    // 请求 KWin forceActivate，不依赖上述副作用。
+                    if !last_active {
+                        debug!("IM inactive on deploy, requesting KWin forceActivate");
+                        self.rt_handle.block_on(self.tray.force_activate_im());
+                    }
+
                     let result = rime.redeploy_with_result();
                     let (summary, body) = match result {
                         librime::DeployResult::Success => {

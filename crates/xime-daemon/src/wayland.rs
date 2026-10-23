@@ -92,18 +92,31 @@ fn build_theme(config: &XimeConfig, dark: bool) -> PanelTheme {
     )
 }
 
-/// 决定按键是否转发给应用（孤儿释放抑制）。
-/// - Rime 消费的按下（`press_consumed`）不转发；其释放事件也不转发，避免孤儿释放。
-/// - 其他按键（未被消费的按下、未被消费的释放）正常转发。
+/// 决定按键是否转发给应用（系统快捷键优先 + 孤儿释放抑制）。
+/// - 带 Ctrl/Alt/Super 的组合键**一律**转发：它们是应用/桌面的快捷键，输入法
+///   只能"借用"（如 Ctrl+Space、Ctrl+Alt+V，那些在上游已单独消费），不能吞。
+///   Rime 的 emacs 键绑定（`Control+a → Home` 等，`when: composing`）会消费这类
+///   按键，若照"被消费就不转发"处理，组合态下 Ctrl+A/C/V 就全废了。
+/// - 其余按键：Rime 消费的按下（`press_consumed`）不转发，其释放事件也不转发，
+///   避免孤儿释放；未被消费的按下/释放正常转发。
 fn should_forward_key(
     pressed: bool,
     result: bool,
     consumed_presses: &std::collections::HashSet<u32>,
     key: u32,
+    system_shortcut: bool,
 ) -> bool {
+    if system_shortcut {
+        return true;
+    }
     let press_consumed = result && pressed;
     let release_of_consumed = !pressed && consumed_presses.contains(&key);
     !press_consumed && !release_of_consumed
+}
+
+/// 是否带 Ctrl/Alt/Super 的应用快捷键修饰（AltGr 是 Mod5，不计入 alt）。
+fn is_system_shortcut(modifiers: &ModifierState) -> bool {
+    modifiers.ctrl || modifiers.alt || modifiers.super_key
 }
 
 /// 空格兜底判定（对齐 XimeYao）：组合态 + 无候选时，空格不上屏首选
@@ -1001,9 +1014,10 @@ impl WaylandLoop {
             return;
         }
 
-        if *candidate_window_visible
-            && is_ctrl
-            && self.handle_ctrl_key(
+        // 字根窗只是"按住 Ctrl 时顺带显示"的一层 UI：Ctrl 键本身必须继续往下
+        // 走并转发给应用，否则应用收不到 Ctrl 按下，后续 Ctrl+C/V/A 全部失效。
+        if *candidate_window_visible && is_ctrl {
+            self.handle_ctrl_key(
                 c,
                 xime_config,
                 theme,
@@ -1014,9 +1028,7 @@ impl WaylandLoop {
                 last_input_keysym,
                 ctrl_root_visible,
                 rime,
-            )
-        {
-            return;
+            );
         }
 
         if let Some(session) = rime.session() {
@@ -1077,10 +1089,17 @@ impl WaylandLoop {
             //   应用只收到上屏的编码文本，不会多出回车符。
             // - 空组合态下 Rime 不消费（result=false），转发给应用（正常换行/执行命令）。
             // 被吞按下的释放事件同样抑制（孤儿释放抑制，对齐 fcitx5）。
-            if should_forward_key(event.pressed, result, consumed_presses, event.key) {
+            let system_shortcut = is_system_shortcut(&modifiers);
+            if should_forward_key(
+                event.pressed,
+                result,
+                consumed_presses,
+                event.key,
+                system_shortcut,
+            ) {
                 c.forward_key(event.serial, event.time, event.key, event.pressed);
             }
-            if result && event.pressed {
+            if result && event.pressed && !system_shortcut {
                 consumed_presses.insert(event.key);
             } else {
                 consumed_presses.remove(&event.key);
@@ -1764,6 +1783,10 @@ impl WaylandLoop {
         }
     }
 
+    /// 按住 Ctrl 时显示上一键的字根（组合态、候选窗可见时）。
+    ///
+    /// 只做显示，**不消费按键**：Ctrl 按下/释放要继续走正常路径转发给应用，
+    /// 否则应用收不到 Ctrl 修饰态，Ctrl+C/V/A 之类的快捷键全部失效。
     #[allow(clippy::too_many_arguments)]
     fn handle_ctrl_key(
         &self,
@@ -1777,7 +1800,7 @@ impl WaylandLoop {
         last_input_keysym: &mut Option<u32>,
         ctrl_root_visible: &mut bool,
         rime: &mut RimeEngine,
-    ) -> bool {
+    ) {
         if event.pressed {
             let ctrl_pressed = modifiers.ctrl;
             let alt_pressed = modifiers.alt;
@@ -1848,7 +1871,6 @@ impl WaylandLoop {
                 }
             }
         }
-        true
     }
 
     /// 会话重建后（词典操作/切方案）按 Rime 实际状态同步托盘中英：
@@ -2208,26 +2230,26 @@ mod tests {
     fn test_should_forward_key_empty() {
         let consumed = HashSet::new();
         // 空组合态按下：未消费 → 转发
-        assert!(should_forward_key(true, false, &consumed, 10));
+        assert!(should_forward_key(true, false, &consumed, 10, false));
         // 空组合态释放：未消费 → 转发
-        assert!(should_forward_key(false, false, &consumed, 10));
+        assert!(should_forward_key(false, false, &consumed, 10, false));
     }
 
     #[test]
     fn test_should_forward_key_consumed_press() {
         let mut consumed = HashSet::new();
         // Rime 消费的按下（如组合态回车）：不转发
-        assert!(!should_forward_key(true, true, &consumed, 10));
+        assert!(!should_forward_key(true, true, &consumed, 10, false));
         consumed.insert(10);
         // 其释放事件：不转发（孤儿释放抑制）
-        assert!(!should_forward_key(false, false, &consumed, 10));
+        assert!(!should_forward_key(false, false, &consumed, 10, false));
     }
 
     #[test]
     fn test_should_forward_key_after_commit() {
         let consumed = HashSet::new();
         // 组合态回车提交编码后，同键的第二次按下（已清空组合）：正常转发
-        assert!(should_forward_key(true, false, &consumed, 10));
+        assert!(should_forward_key(true, false, &consumed, 10, false));
     }
 
     #[test]
@@ -2235,8 +2257,45 @@ mod tests {
         let mut consumed = HashSet::new();
         consumed.insert(10);
         // 10 的释放被抑制，但其他键不受影响
-        assert!(!should_forward_key(false, false, &consumed, 10));
-        assert!(should_forward_key(false, false, &consumed, 20));
+        assert!(!should_forward_key(false, false, &consumed, 10, false));
+        assert!(should_forward_key(false, false, &consumed, 20, false));
+    }
+
+    #[test]
+    fn test_should_forward_key_system_shortcut_always_forwarded() {
+        let mut consumed = HashSet::new();
+        // 组合态下 Rime 的 emacs 绑定（Control+a → Home 等）会消费 Ctrl 组合键，
+        // 但快捷键必须优先给应用：被消费也要转发。
+        assert!(should_forward_key(true, true, &consumed, 30, true));
+        // 按下已转发，释放也必须转发（不能当成"被消费按下的释放"抑制掉）
+        consumed.insert(30);
+        assert!(should_forward_key(false, true, &consumed, 30, true));
+        assert!(should_forward_key(false, false, &consumed, 30, true));
+    }
+
+    #[test]
+    fn test_is_system_shortcut() {
+        assert!(!is_system_shortcut(&ModifierState::default()));
+        assert!(!is_system_shortcut(&ModifierState {
+            shift: true,
+            ..ModifierState::default()
+        }));
+        for m in [
+            ModifierState {
+                ctrl: true,
+                ..ModifierState::default()
+            },
+            ModifierState {
+                alt: true,
+                ..ModifierState::default()
+            },
+            ModifierState {
+                super_key: true,
+                ..ModifierState::default()
+            },
+        ] {
+            assert!(is_system_shortcut(&m));
+        }
     }
 
     fn qs_entries() -> Vec<(String, String)> {

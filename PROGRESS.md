@@ -1,9 +1,34 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**打包：CI 一条 tag 产出 deb / rpm / Arch 包 / 便携 tarball / 源码包 + AUR 提交物**
-（2026-10-23）。此前：Wayland 连接楔死导致按键黑洞修复（2026-10-11）、
-语音交互层（5dc47e3）、日志体系 + 全仓审查（2026-10-07）。
+**修复：Ctrl/Alt/Super 组合键被 Rime 吞掉，导致所有 Ctrl 快捷键失效**
+（2026-10-23）。此前：多发行版打包（2026-10-23）、Wayland 连接楔死导致按键黑洞修复
+（2026-10-11）、语音交互层（5dc47e3）、日志体系 + 全仓审查（2026-10-07）。
+
+## 本次变更（2026-10-23）：Ctrl 快捷键被输入法吞掉
+
+**现象**：用户反馈"输入法好像占用了 Ctrl，所有 Ctrl 快捷键都失效"。
+
+**根因**（用户日志 + 探针双重实锤）：
+- `~/.config/xime/rime/default.custom.yaml`（来自 rime-wubi 上游）带 rime-prelude 的
+  emacs 键绑定：`{ when: composing, accept: Control+a, send: Home }`，同组还有
+  `Control+e/v/p/n/b/f/d/k/h/g`、`Alt+v`。
+- 探针 `cargo run -p xime-daemon --example key_probe`：非组合态 Ctrl+A
+  `consumed=false`，**组合态 `consumed=true`**。
+- 用户日志 22:41:05：`keysym=97, modifiers=4` → `Rime result: true` → 老逻辑
+  "被 Rime 消费就不转发"把事件吃掉，应用根本收不到 Ctrl+A。
+- 对照 fcitx5-rime（`rimestate.cpp`）：它也是 `process_key` 返回 true 就
+  `filterAndAccept()`，**没有** Ctrl 特判——差别只在它的默认配置里没有这组 emacs
+  绑定。所以这不是"fcitx5 有魔法"，是配置差异。
+
+**修复**：
+- `should_forward_key` 增加 `system_shortcut`：带 Ctrl/Alt/Super 的组合键
+  **一律**转发给应用（Alt 只算 Mod1，AltGr=Mod5 不受影响），Rime 仍可处理但不能独吞。
+- `handle_ctrl_key`（按住 Ctrl 显示字根窗）不再消费 Ctrl 键本身，改成纯显示层。
+- 新增两个单元测试：系统快捷键必转发（含释放）、`is_system_shortcut` 位判定。
+
+**验证**：daemon 73 个单元测试通过；`clippy -D warnings`、`fmt --check` 通过；
+探针复现并解释了根因。真机需要重新安装后验证（组合态按 Ctrl+A/C/V，且应用能收到）。
 
 ## 本次变更（2026-10-23）：多发行版打包
 

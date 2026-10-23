@@ -1,0 +1,42 @@
+# Maintainer: Kor1 <kingzcheung@gmail.com>
+# Arch / Manjaro / EndeavourOS 打包配方（AUR 可直接使用）。
+#
+# 本地构建:  cd packaging/arch && makepkg -si
+# CI 会用 tag 覆盖 pkgver，仓库里保持与 Cargo.toml 的 version 一致即可。
+
+pkgname=xime
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="曦码 — 基于 Rime 引擎与自绘候选窗的 Wayland 中文输入法"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ximeiorg/XimeChe"
+license=('GPL-3.0-or-later')
+depends=('librime' 'libxkbcommon' 'wayland' 'dbus' 'bzip2' 'gcc-libs' 'hicolor-icon-theme' 'desktop-file-utils')
+makedepends=('cargo' 'rust' 'git' 'pkgconf')
+install="$pkgname.install"
+# rime-wubi 是 git 子模块：makepkg 不会初始化子模块，这里单独拉取。
+# 升级子模块后请用 `git submodule status` 同步下面的 commit。
+_rime_wubi_commit=ae27544dd1ce4d795a3be1b791e9439d9612de15
+source=(
+    "$pkgname::git+$url.git#tag=$pkgver"
+    "rime-wubi::git+https://github.com/kingzcheung/rime-wubi.git#commit=$_rime_wubi_commit"
+)
+sha256sums=('SKIP' 'SKIP')
+
+prepare() {
+    mkdir -p "$srcdir/$pkgname/rime-wubi"
+    cp -a "$srcdir/rime-wubi/." "$srcdir/$pkgname/rime-wubi/"
+    rm -rf "$srcdir/$pkgname/rime-wubi/.git"
+}
+
+build() {
+    cd "$srcdir/$pkgname"
+    # 不用 --locked：libximecore 的 git 依赖在本地被 .cargo/config.toml patch
+    # 成路径依赖，Cargo.lock 没有对应 git 条目，构建时需要联网解析。
+    cargo build --release
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+    ./packaging/stage.sh "$pkgdir" /usr
+}

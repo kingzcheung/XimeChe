@@ -4,12 +4,61 @@ on:
   push:
     tags:
       - '*'
+  # 手动触发用于试跑打包链路（不发 Release，版本号取 Cargo.toml）
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-deb:
+  # 版本号唯一来源：tag。顺带校验 Cargo.toml 已同步，并产出「含子模块」的
+  # 源码包（GitHub 自动生成的 /archive/ 包不含 rime-wubi，rpm/arch 构建依赖它）。
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve version
+        id: resolve
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+            if [ "$VERSION" != "$CARGO_VERSION" ]; then
+              echo "::error::tag ${VERSION} 与 Cargo.toml 的版本 ${CARGO_VERSION} 不一致"
+              exit 1
+            fi
+          else
+            VERSION="$CARGO_VERSION"
+            echo "::warning::手动触发：按 Cargo.toml 的版本 ${VERSION} 试构建，不会创建 Release"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create source tarball
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          tar \
+            --exclude=./.git \
+            --exclude=./.github \
+            --exclude=./target \
+            --transform "s|^\./|XimeChe-$VERSION/|" \
+            -czf "xime-$VERSION.tar.gz" .
+
+      - name: Upload source tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: xime-source
+          path: xime-*.tar.gz
+          if-no-files-found: error
+
+  # Debian / Ubuntu / Mint 等：.deb + 便携 tarball
+  deb:
+    needs: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,12 +79,9 @@ jobs:
             libfreetype6-dev \
             pkg-config
 
-      # .cargo/config.toml 把 libximecore patch 到 ../libximecore（本地开发
-      # 工作流）；CI 上不存在该路径时 cargo 回退 Cargo.lock 锁定的旧 rev，
-      # 缺语音相关 API 会导致编译失败——检出同仓库最新 main 保持一致。
-      - name: Checkout libximecore
-        run: git clone --depth 1 https://github.com/ximeiorg/libximecore.git ../libximecore
-
+      # 说明：Cargo.lock 里 libximecore 相关 crate 被本地 .cargo/config.toml
+      # patch 成路径依赖（无 git 条目），CI 上没有该 patch，cargo 会从 GitHub
+      # 解析 libximecore@main 并自行补全锁文件——这就是发版构建的实际依赖来源。
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -56,7 +102,7 @@ jobs:
       - name: Build release binaries
         run: cargo build --release
 
-      # 语音运行库拷到 target/release：xime-pack 的 deb assets 引用该路径
+      # 语音运行库拷到 target/release：cargo-deb 的 assets 引用该路径
       # （随包分发到 /usr/share/xime/lib，daemon rpath $ORIGIN/../share/xime/lib）。
       - name: Stage speech runtime libs
         run: |
@@ -66,29 +112,161 @@ jobs:
       - name: Build Debian package
         run: cargo deb -p xime
 
-      - name: Get version from tag
-        id: get_version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      - name: Build portable tarball
+        run: |
+          VERSION="${{ needs.source.outputs.version }}"
+          ./packaging/stage.sh "$PWD/target/stage" /usr
+          tar --owner=0 --group=0 --numeric-owner \
+            -C target/stage -czf "xime-$VERSION-x86_64-linux.tar.gz" .
 
-      - name: Upload artifact
+      - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: xime-deb
           path: target/debian/xime_*_amd64.deb
+          if-no-files-found: error
+
+      - name: Upload portable tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: xime-tarball
+          path: xime-*-x86_64-linux.tar.gz
+          if-no-files-found: error
+
+  # Fedora / RHEL / openSUSE 等：.rpm（在 Fedora 容器里真编真打）
+  rpm:
+    needs: source
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install git (checkout 需要)
+        run: dnf install -y --setopt=install_weak_deps=False git tar gzip
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            rpm-build redhat-rpm-config \
+            cargo rust \
+            gcc gcc-c++ make pkgconf-pkg-config \
+            librime-devel libxkbcommon-devel
+
+      - name: Build RPM
+        run: |
+          VERSION="${{ needs.source.outputs.version }}"
+          sed -i "s/^Version:.*/Version:        $VERSION/" packaging/rpm/xime.spec
+          mkdir -p rpmbuild/SOURCES
+          tar \
+            --exclude=./.git \
+            --exclude=./.github \
+            --exclude=./target \
+            --exclude=./rpmbuild \
+            --transform "s|^\./|XimeChe-$VERSION/|" \
+            -czf "rpmbuild/SOURCES/xime-$VERSION.tar.gz" .
+          rpmbuild -bb packaging/rpm/xime.spec \
+            --define "_topdir $PWD/rpmbuild" \
+            --define "dist .fc$(rpm -E %fedora)" \
+            --define "debug_package %{nil}"
+
+      - name: Smoke test
+        run: |
+          dnf install -y ./rpmbuild/RPMS/*/*.rpm
+          ldd /usr/bin/xime-daemon
+          ldd /usr/bin/xime-daemon | grep -q 'libsherpa-onnx-c-api.so => /usr/share/xime/lib/'
+          test -f /usr/share/dbus-1/services/org.xime.Xime.service
+          test -f /usr/share/xime/rime-data/wubi86.schema.yaml
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: xime-rpm
+          path: rpmbuild/RPMS/**/*.rpm
+          if-no-files-found: error
+
+  # Arch / Manjaro / EndeavourOS 等：.pkg.tar.zst（直接跑 PKGBUILD，顺带验证它）
+  arch:
+    needs: source
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install git (checkout 需要)
+        run: pacman -Syu --noconfirm --needed git
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: pacman -S --noconfirm --needed rust librime libxkbcommon hicolor-icon-theme pkgconf
+
+      - name: Build package
+        run: |
+          VERSION="${{ needs.source.outputs.version }}"
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" packaging/arch/PKGBUILD
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --nodeps --nocheck --noconfirm"
+
+      # 装上验证：daemon 必须能按 rpath 找到随包分发的语音库，
+      # 并确认方案数据 / DBus 服务到位；namcap 只作提示。
+      - name: Smoke test
+        run: |
+          pacman -S --noconfirm --needed namcap
+          namcap packaging/arch/*.pkg.tar.zst || true
+          pacman -U --noconfirm packaging/arch/*.pkg.tar.zst
+          ldd /usr/bin/xime-daemon
+          ldd /usr/bin/xime-daemon | grep -q 'libsherpa-onnx-c-api.so => /usr/share/xime/lib/'
+          test -x /usr/bin/xime-launcher
+          test -f /usr/share/dbus-1/services/org.xime.Xime.service
+          test -f /usr/share/xime/rime-data/wubi86.schema.yaml
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xime-arch
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+      # AUR 提交物：PKGBUILD + .SRCINFO + install 钩子（pkgver 已按 tag 覆写），
+      # 解开直接推到 aur.archlinux.org 的空仓库里即可。
+      - name: Generate AUR metadata
+        run: |
+          cd packaging/arch
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --printsrcinfo" > .SRCINFO
+          test -s .SRCINFO
+          grep -q '^pkgver = ' .SRCINFO
+          tar -czf "$GITHUB_WORKSPACE/xime-${{ needs.source.outputs.version }}-aur.tar.gz" \
+            PKGBUILD .SRCINFO xime.install
+
+      - name: Upload AUR files
+        uses: actions/upload-artifact@v4
+        with:
+          name: xime-aur
+          path: xime-*-aur.tar.gz
+          if-no-files-found: error
 
   release:
-    needs: build-deb
+    needs: [source, deb, rpm, arch]
+    # 手动触发的试跑只产出 artifact，不建 Release
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download artifact
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: xime-deb
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: xime_*_amd64.deb
+          files: dist/*
           generate_release_notes: true

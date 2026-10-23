@@ -1,8 +1,39 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**修复：Wayland 连接楔死导致按键黑洞（Ctrl+A 全选失灵的根因）**
-（2026-10-11）。此前语音交互层（5dc47e3）、日志体系 + 全仓审查（2026-10-07）。
+**打包：CI 一条 tag 产出 deb / rpm / Arch 包 / 便携 tarball / 源码包 + AUR 提交物**
+（2026-10-23）。此前：Wayland 连接楔死导致按键黑洞修复（2026-10-11）、
+语音交互层（5dc47e3）、日志体系 + 全仓审查（2026-10-07）。
+
+## 本次变更（2026-10-23）：多发行版打包
+
+**目标**：发版时除 .deb 外，同时产出 RPM、Arch 包、便携 tarball 和源码包，
+让各发行版用户不必自己编译。
+
+**做法**：
+- 新增 `packaging/stage.sh`：唯一安装布局脚本（.deb 仍走 cargo-deb，保持已验证
+  的产物不动）；语音运行库从 `target/release` 收集到 `$PREFIX/share/xime/lib`，
+  缺失时直接报错不静默出坏包，`XIME_SKIP_SPEECH=1` 可跳过。
+- `packaging/rpm/xime.spec`：Fedora/RHEL/openSUSE 源码构建（含 suse 的 librime1 分支）。
+- `packaging/arch/{PKGBUILD,xime.install}`：AUR 可直接用；rime-wubi 子模块在
+  `prepare()` 里单独拉取，`post_install` 刷桌面/图标缓存并打印 KDE 启用提示。
+- `.github/workflows/release.yml` 重构为 source / deb / rpm / arch / release：
+  rpm 在 `fedora:latest` 容器、arch 在 `archlinux:base-devel` 容器里**原生编译**；
+  arch job 还会 `pacman -U` 装一遍并用 `ldd` 验证 daemon 能按 rpath 找到
+  随包分发的语音库，同时生成 `.SRCINFO` 打成 `xime-<ver>-aur.tar.gz`；
+  rpm job 同样装一遍验证。支持 `workflow_dispatch` 手动试跑（不创建 Release）。
+- 版本号以 tag 为准，并校验与 `Cargo.toml` 一致；源码包带子模块
+  （GitHub 自动生成的源码包不含 rime-wubi，rpm/arch 构建依赖它）。
+- 补了 deb 缺失的运行库依赖（libwayland-client0 / libdbus-1-3 / libbz2-1.0）。
+
+**验证**：`stage.sh` 在临时目录做了 dry-run（正常布局、自定义 prefix、跳过语音、
+缺二进制、缺语音库五种路径）；workflow YAML、PKGBUILD、install 脚本 `bash -n` 通过。
+容器内的 rpm/arch 构建没法在本机验证（本机是 Debian，无 rpmbuild/makepkg），
+只能等 CI 跑。
+
+**未做**：Flatpak/Snap（沙箱拿不到 KWin 传的 WAYLAND_SOCKET fd，架构冲突）、
+Alpine（sherpa-onnx 只提供 glibc 预编译库）、Nix flake（需要固定 hash，暂无 nix 环境）。
+详见 `packaging/README.md`。
 
 ## 本次变更（2026-10-11）：dispatch 永久阻塞修复（按键黑洞根治）
 

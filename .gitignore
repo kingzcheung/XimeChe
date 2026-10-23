@@ -2,3 +2,10 @@
 # Local cargo config (created by dev-install.sh for libximecore patch)
 .cargo/config.toml
 .zcode/
+
+# 打包中间产物
+/rpmbuild/
+/packaging/arch/src/
+/packaging/arch/pkg/
+*.pkg.tar.zst
+*.deb

@@ -234,3 +234,23 @@ custom_phrase.txt 无损；方案词表 91397 条 40ms；libximecore 4 组部署
 1. Android 版验证过的职责划分：本地剪贴板稳定在宿主，跨设备同步交给插件生态
 2. fail-closed 补上了 host.http 白名单缺失的安全洞（此前任意插件可联网）
 3. 同步在独立线程：Lua http 20s 超时不阻塞按键路径
+
+## 2026-10-23: 打包：一个 stage.sh + 各发行版原生构建
+
+**背景**：此前只有 `cargo-deb` 产出的 `.deb`，Fedora / Arch 用户只能自己编译。
+
+**决策**：
+1. 安装布局集中到 `packaging/stage.sh`；`.deb` 继续走 `cargo-deb`（已验证过的产物不折腾），
+   两边文件清单需要人工同步，并在两处注释里写明。
+2. rpm / arch 在各自发行版容器里**从源码编译**，而不是把 Ubuntu 二进制换个壳：
+   glibc 版本、依赖关系才对；CI 各 job 并行，墙钟时间不增加。
+3. Arch 包直接跑仓库里的 PKGBUILD，等于每次发版都验证 AUR 配方，并由 CI 生成
+   `.SRCINFO`（手写容易偏移，AUR 会因为 PKGBUILD 与 `.SRCINFO` 不一致拒收）。
+4. 版本号唯一来源是 tag，且必须与 `Cargo.toml` 的 `[workspace.package] version` 一致，
+   不一致直接失败——宁可红，不出版本号错乱的包。
+5. Flatpak / Snap 明确不做：输入法 daemon 必须作为 KWin 的虚拟键盘客户端工作
+   （KWin 通过 `WAYLAND_SOCKET` 传 fd，daemon 再用 `zwp_input_method_v2` 收发按键），
+   沙箱里既拿不到这个 fd，也无法被 KWin 选为虚拟键盘。这不是权限问题，是架构冲突。
+
+**理由**：包管理器用户不该被迫自己装 Rust 工具链；而输入法要接入的是 KWin 的
+输入法通道，深到任何沙箱格式都覆盖不了。

@@ -59,7 +59,8 @@ cargo install cargo-deb && cargo deb -p xime
 
 # rpm（Fedora 上）
 dnf install rpm-build cargo rust git gcc gcc-c++ make pkgconf-pkg-config \
-            librime-devel libxkbcommon-devel
+            librime-devel libxkbcommon-devel wayland-devel dbus-devel \
+            fontconfig-devel freetype-devel clang clang-devel
 rpmbuild -bb packaging/rpm/xime.spec --define "_topdir $PWD/rpmbuild"
 
 # Arch

@@ -156,7 +156,9 @@ jobs:
             rpm-build redhat-rpm-config \
             cargo rust \
             gcc gcc-c++ make pkgconf-pkg-config \
-            librime-devel libxkbcommon-devel
+            librime-devel libxkbcommon-devel libxkbcommon-x11-devel \
+            wayland-devel dbus-devel fontconfig-devel freetype-devel \
+            clang clang-devel
 
       - name: Build RPM
         run: |
@@ -204,7 +206,7 @@ jobs:
           submodules: recursive
 
       - name: Install build dependencies
-        run: pacman -S --noconfirm --needed rust librime libxkbcommon hicolor-icon-theme pkgconf
+        run: pacman -S --noconfirm --needed rust librime libxkbcommon libxkbcommon-x11 wayland dbus fontconfig freetype2 hicolor-icon-theme pkgconf clang
 
       - name: Build package
         run: |

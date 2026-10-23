@@ -12,7 +12,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/ximeiorg/XimeChe"
 license=('GPL-3.0-or-later')
 depends=('librime' 'libxkbcommon' 'wayland' 'dbus' 'bzip2' 'gcc-libs' 'hicolor-icon-theme' 'desktop-file-utils')
-makedepends=('cargo' 'rust' 'git' 'pkgconf')
+makedepends=('cargo' 'rust' 'git' 'pkgconf' 'clang')
 install="$pkgname.install"
 # rime-wubi 是 git 子模块：makepkg 不会初始化子模块，这里单独拉取。
 # 升级子模块后请用 `git submodule status` 同步下面的 commit。

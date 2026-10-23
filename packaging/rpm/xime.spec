@@ -40,6 +40,10 @@ BuildRequires:  make
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  librime-devel
 BuildRequires:  libxkbcommon-devel
+# libquickjs-ng-sys 用 bindgen，需要 libclang（Fedora 的 clang-libs 提供 .so）
+BuildRequires:  clang
+# libdbus-sys 走 pkg-config
+BuildRequires:  dbus-devel
 
 Requires(post):   desktop-file-utils
 Requires(postun): desktop-file-utils

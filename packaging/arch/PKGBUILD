@@ -31,6 +31,11 @@ prepare() {
 
 build() {
     cd "$srcdir/$pkgname"
+    # Arch 的工具链给 rustc 默认加了 -fuse-ld=lld；lld 链接 sherpa-onnx-sys
+    # 的 build script（zip 的 zstd + ring 静态库）时会漏掉 ZSTD_*/ring_core_*
+    # 符号报 undefined symbol，同一份代码在 Debian（GNU ld/bfd）上正常。
+    # 放在 RUSTFLAGS 末尾以覆盖前面的 -fuse-ld。
+    export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=bfd"
     # 不用 --locked：libximecore 的 git 依赖在本地被 .cargo/config.toml patch
     # 成路径依赖，Cargo.lock 没有对应 git 条目，构建时需要联网解析。
     cargo build --release

@@ -56,9 +56,12 @@ input-method 协议并复用 Rime 引擎，候选窗自绘。
 %autosetup -n %{srcname}-%{version}
 
 %build
+# 统一用 GNU ld/bfd 链接：Arch 的工具链默认塞 -fuse-ld=lld，lld 链接
+# sherpa-onnx-sys 的 build script（zip 的 zstd + ring 静态库）会报
+# ZSTD_*/ring_core_* undefined symbol；这里显式指定，各发行版行为一致。
 # 不加 --locked：libximecore 的 git 依赖在本地开发时被 .cargo/config.toml
 # patch 成路径依赖，Cargo.lock 里没有对应的 git 条目，构建时需要联网解析。
-cargo build --release
+RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=bfd" cargo build --release
 
 %install
 ./packaging/stage.sh %{buildroot} %{_prefix}

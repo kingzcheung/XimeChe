@@ -106,6 +106,8 @@ makepkg --printsrcinfo > .SRCINFO    # 推 AUR 前生成元数据
   `gcc-libs`、`hicolor-icon-theme`、`desktop-file-utils`。
 - `rime-wubi` 是 git 子模块，makepkg 不会自动初始化，`prepare()` 会单独拉取并
   填回源码树；升级子模块后记得同步 PKGBUILD 里的 `_rime_wubi_commit`。
+- 链接器用 GNU ld/bfd（`build()` 里显式 `-fuse-ld=bfd`）：Arch 工具链默认的 lld
+  在链接 `sherpa-onnx-sys` build script（zip 的 zstd + ring 静态库）时会漏符号。
 - CI 的 Arch job 不只是打个包：它会把生成的 `.pkg.tar.zst` 装进容器，用 `ldd`
   确认 daemon 能按 rpath 找到 `/usr/share/xime/lib` 下的语音库，并检查方案数据、
   DBus 服务、可执行文件都在位（`namcap` 的输出只作为提示）。

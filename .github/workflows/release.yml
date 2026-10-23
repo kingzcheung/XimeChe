@@ -42,12 +42,16 @@ jobs:
       - name: Create source tarball
         run: |
           VERSION="${{ steps.resolve.outputs.version }}"
+          # 先写到工作区外：输出文件如果落在被归档的目录里，tar 会读到
+          # 自己正在写的文件，报 "file changed as we read it"（退出码 1，
+          # bash -e 下直接判失败）。
           tar \
             --exclude=./.git \
             --exclude=./.github \
             --exclude=./target \
             --transform "s|^\./|XimeChe-$VERSION/|" \
-            -czf "xime-$VERSION.tar.gz" .
+            -czf "$RUNNER_TEMP/xime-$VERSION.tar.gz" .
+          mv "$RUNNER_TEMP/xime-$VERSION.tar.gz" .
 
       - name: Upload source tarball
         uses: actions/upload-artifact@v4

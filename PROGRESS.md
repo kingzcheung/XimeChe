@@ -1,9 +1,45 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**修复：Ctrl/Alt/Super 组合键被 Rime 吞掉，导致所有 Ctrl 快捷键失效**
-（2026-10-23）。此前：多发行版打包（2026-10-23）、Wayland 连接楔死导致按键黑洞修复
-（2026-10-11）、语音交互层（5dc47e3）、日志体系 + 全仓审查（2026-10-07）。
+**修复：两个 context 的 serial 互相覆盖，导致选词后不上屏**
+（2026-10-26）。此前四波修复（同日）：v1 未转发 modifiers、退出不释放
+grab、双 IM 连接抖动、librime ABI 断裂。更早：Ctrl 快捷键被 Rime 吞掉
+（2026-10-23）、多发行版打包（2026-10-23）。
+
+## 本次变更（2026-10-26）：serial 与 context 必须成对绑定
+
+**现象**：WorkBuddy 里中文时好时坏——候选词正常出现，但**选词后不上屏**，
+或上到别的窗口；有时切个窗口又恢复正常。
+
+**根因**：`InputMethodV1Data.serial` 是单值 `u32`，而 KWin 为每个文本输入
+客户端各建一个 `zwp_input_method_context_v1`，两者**同时**上报
+`commit_state`，后写覆盖先写。协议要求 `commit_string` 的 serial 必须是
+该 context 自己的，序列号对不上客户端就丢弃。
+
+**日志实锤**（21:43:28–31，严格交替的两条序列）：
+```
+294 1805 1806 295 1807 1808 296 1809 1810 297 1811 1812 298 1813 1814 1815 307 …
+```
+全天统计：小序列 1494 次 : 大序列 902 次。
+
+**修复**：
+- 新增 `ActiveContext { ctx, serial }`，`context` 字段类型改为
+  `Arc<Mutex<Option<ActiveContext>>>`，serial 只能随 context 一起取。
+- `Dispatch<ZwpInputMethodContextV1>` 增加来源判定：先比对
+  `active.ctx == *proxy`，非活跃 context 的 `commit_state` /
+  `surrounding_text` / `content_type` / `reset` 一律不写共享状态。
+- `commit_string` / `set_preedit` / `clear_preedit` 改用 `active.serial`；
+  `state.serial` 降级为诊断字段，注释标明不可用于发送。
+- `deactivate` 增加同源判定：只有停用的正是活跃 context 才清引用，
+  避免窗口 A 失焦抹掉窗口 B 的 context。
+
+**验证**：`xime-wayland` 18 测试通过；`clippy --all-targets -D warnings`
+干净。`cargo test` 全量在 `xime-setup` 链接阶段失败
+（gpui 系依赖，与本次改动无关，属既有问题）。
+
+**注意**：本次排查发现 daemon 进程已死且 `org.xime.Xime` 被孤儿连接
+`:1.705` 占用——那是排查过程中沙箱内启动失败留下的。真机需先
+`pkill -f xime-daemon` 清干净，再重新安装并启动。
 
 ## 本次变更（2026-10-23）：Ctrl 快捷键被输入法吞掉
 
@@ -958,8 +994,92 @@ alt-tab 切走再切回。
 - **xime-setup/launcher/pack**: 0 tests (UI 密集型，需集成测试)
 - **总计**: ~247 tests
 
+## 修复（2026-10-26）：双 IM 连接导致激活抖动、Chromium 138 应用完全打不了中文
+
+**用户现象**：WorkBuddy（内置 Chrome/138.0.7204.251）及所有应用都无法输入中文。
+
+**前置问题（已修）**：Debian sid 升级移除 `libyaml-cpp0.8` / `libmarisa0`(0.2)、
+opencc 升 1.4，预编译 `librime.so.1.17.0` 的旧 soname 全部失配，daemon 启动即
+`error while loading shared libraries` 退出。修复：`cmake build -B build` 重新
+配置 + 增量重建 librime，产物覆盖 `../libximecore/librime/dist/lib/`。
+（不可直接用系统 `librime1t64`——本项目依赖 librime-lua 插件，系统包不含。）
+
+**真根因**：daemon 同时建立了**两条** IM 连接。
+- 启动时 `connect_im_to_env()` 成功 → 打出 "Connected directly to compositor
+  (standalone mode)"
+- launcher 送 fd 后 `connect_im_from_fd()` 又成功 → "Connected via launcher fd
+  (KWin mode)"
+- 两个 `zwp_input_method_v1` 对象同时向 KWin 注册，争抢 keyboard grab，互踢
+
+**日志实锤**：21:26:10 起 4 秒内 12 次 ACTIVATE、6 次 DEACTIVATE；同一事件成对
+出现（`serial=944` 两次、`945` 两次、RESET 两次）。用户侧表现 = 输入法失效。
+
+**代码根因**：`crates/xime-daemon/src/wayland.rs` 里 `conn = Some(backend)`
+直接覆盖旧连接而不拆除；且原注释假设"KWin 下普通 socket 不暴露 IM 协议，
+直连必败"——KWin 6.7.4 上**不成立**。
+
+**修复**：
+1. `xime_launcher_running()`：`pgrep -x xime-launcher` 判断会话类型。
+   launcher 在跑（KWin）→ **跳过直连**，只等 launcher fd；否则才直连。
+2. `ImBackend::shutdown()` + v1/v2 各自 `teardown_im_objects()`：launcher 接管
+   前先拆旧连接并 flush（二道防线）。
+   注意 `zwp_input_method_v1` **无 destroy 请求**，客户端无法主动注销 IM
+   对象，只能靠断开整条连接——所以源头不建第二条才是关键。
+
+**排除的假设**：一度怀疑 Chromium 138 的 text-input disable 后不重新 enable
+（KWin 493098，QQ 同源）。但日志显示 ACTIVATE 确实到达 daemon，text-input 是
+通的，该假设不成立。记录避免后续重走。
+
+**验证**：`clippy -D warnings` 无新增告警；xime-wayland 73 + xime-daemon 18
+测试全过；release 构建产物已安装到 `~/.local/bin/xime-daemon`（旧版备份为
+`xime-daemon.old`）。真机重启后待观察激活抖动是否消失。
+
+## 修复（2026-10-26 第 4 波）：v1 未转发 modifiers → 终端 Ctrl+C/X/Z 全失效
+
+**用户现象**：终端里 Ctrl+C（SIGINT）、Ctrl+X 完全无效。
+
+**根因**：`grab_keyboard` 后只转发 `key`，**从未转发配套的 `modifiers`**
+（`im_v1.rs` 里 `.modifiers(` 零命中）。协议里 `key` 只携带按键本身，修饰
+位必须靠 `modifiers(serial, depressed, latched, locked, group)` 通知。缺它
+应用收到的是不带 Ctrl 的孤立 `c`，不会触发 SIGINT。
+
+**日志实锤**：`keysym=65507 (Ctrl) modifiers=4` → `keysym=99 (c)
+modifiers=4`，daemon 侧状态正确、Rime 未消费，说明逻辑层正常，纯粹是转发
+时丢了修饰键。
+
+**修复**：
+1. `im_v1::forward_modifiers()` + `ImBackend::forward_modifiers()`
+   （v2 默认空实现——text-input-v3 由合成器维护修饰态）
+2. daemon 在 `forward_key` 前转发，仅 `effective` 变化时发
+3. 重新激活时重置 `forwarded_modifiers = None`
+4. serial 用键盘事件的，不用 commit_state 的
+
+**验证**：新增 `test_system_shortcut_always_forwarded`；73 + 72 测试全过；
+release 已安装。
+
+## 修复（2026-10-26 第 3 波）：daemon 退出不释放 grab → 系统快捷键全瘫
+
+**用户现象**：输入法相关操作后，系统里很多快捷键不响应（Alt+Tab、Super、
+Ctrl+C 等）。
+
+**根因**：`clean_exit()` 是 `libc::_exit(0)`，跳过所有析构，Wayland 连接
+不走正常关闭流程。KWin 侧 recyclable grab 若未及时回收，键盘事件持续路由到
+已死客户端的通道 → 所有按键进黑洞。两条退出路径
+（`DaemonCommand::Shutdown`、命令通道断开）都直接 `clean_exit()` 而无清理。
+
+**协议约束**：`zwp_input_method_v1` 无 release grab 请求，客户端无法主动
+释放；只能靠断开连接让合成器回收。
+
+**修复**：新增 `shutdown_im_connection()`，在 `clean_exit()` **之前**调用
+`ImBackend::shutdown()` + flush + drop，让 KWin 立刻感知客户端断开。
+
+**验证**：73 + 18 测试全过；release 已安装。
+
 ## 下一步
-1. **GNOME 实机验证 v2 后端**（输入、候选窗定位、Shift 切换、锁屏恢复）
+1. **实机验证双连接修复**：重启 daemon，在 WorkBuddy 输入中文，确认
+   ACTIVATE/DEACTIVATE 不再成对抖动、候选窗正常上屏
+2. **验证退出清理**：`dbus-send ... Shutdown` 后确认系统快捷键立即恢复
+3. **GNOME 实机验证 v2 后端**（输入、候选窗定位、Shift 切换、锁屏恢复）
 2. GNOME 自启动机制（XDG autostart 或 systemd user unit，直接启动 xime-daemon）
 3. 测试 xime-setup（Iced 版）单例锁 + DBus 通知 + SelectSchema 切换方案
 4. 测试主题颜色实时更新功能（重新安装后验证）

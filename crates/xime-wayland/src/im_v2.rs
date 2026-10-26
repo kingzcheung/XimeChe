@@ -647,6 +647,31 @@ impl WaylandConnectionV2 {
         Ok(())
     }
 
+    /// 主动拆除 IM 对象并同步到合成器，让合成器立刻注销本客户端。
+    ///
+    /// 与 `handle_unavailable` 的区别：那个是"销毁后重建"，这个是"销毁即
+    /// 收摊"。daemon 在 launcher 接管连接前调用，避免旧 IM 对象残留在
+    /// 合成器侧与新连接并存（两个客户端抢 keyboard grab → 激活抖动）。
+    pub fn teardown_im_objects(&mut self) -> Result<()> {
+        // 先撤掉依附于 IM 的 popup 与候选 surface。
+        if let Some(popup) = self.input_popup_surface.take() {
+            popup.destroy();
+        }
+        self.candidate_surface = None;
+        self.current_buffer = None;
+        self.current_pool = None;
+
+        if let Some(im) = self.input_method.take() {
+            im.destroy();
+        }
+        self.state.state = InputMethodState::Inactive;
+
+        // 销毁请求必须 roundtrip 一次才算送达——drop 只关本地 socket，
+        // 合成器侧的 IM 对象会残留。
+        self.sync_roundtrip()?;
+        Ok(())
+    }
+
     /// Recreate the input method object after an `unavailable` event (e.g.
     /// GNOME lock screen). The old object becomes inert and must be destroyed.
     pub fn handle_unavailable(&mut self) -> Result<()> {

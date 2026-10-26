@@ -50,46 +50,10 @@ pub enum InputMethodV1State {
     Active,
 }
 
-/// 一个活跃的输入上下文：协议对象 + 它自己的 `commit_state` 序列号。
-///
-/// 两者必须同生共死。KWin 为每个文本输入客户端各建一个
-/// `zwp_input_method_context_v1`，各自维护独立的 serial 序列；协议要求
-/// IM 在 `commit_string` / `preedit_string` / `delete_surrounding_text`
-/// 里回传该 context 最近一次的 serial，序列号对不上的请求会被客户端丢弃。
-pub struct ActiveContext {
-    pub ctx: ZwpInputMethodContextV1,
-    pub serial: u32,
-}
-
-impl Clone for ActiveContext {
-    fn clone(&self) -> Self {
-        Self {
-            ctx: self.ctx.clone(),
-            serial: self.serial,
-        }
-    }
-}
-
-impl std::fmt::Debug for ActiveContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ActiveContext")
-            .field("ctx", &self.ctx)
-            .field("serial", &self.serial)
-            .finish()
-    }
-}
-
 pub use crate::{KeyEvent, PointerEvent};
 
 #[derive(Clone, Default)]
 pub struct InputMethodV1Data {
-    /// 最近一次收到的 `commit_state` serial（**仅供诊断/兼容**）。
-    ///
-    /// 2026-10-26 实锤：KWin 会为不同窗口各建一个
-    /// `zwp_input_method_context_v1`，它们**同时**往同一个 state 上报
-    /// `commit_state`。两条序列严格交替（日志里 294,1805,1806,295,1807…，
-    /// 1494:902 的交叉比），后写的覆盖先写的。因此本字段**不可**用于
-    /// 发送请求——必须用 [`ActiveContext::serial`]，那是和 context 绑定的。
     pub serial: u32,
     pub state: InputMethodV1State,
     pub surrounding_text: Option<String>,
@@ -97,13 +61,7 @@ pub struct InputMethodV1Data {
     pub surrounding_anchor: u32,
     pub content_hint: u32,
     pub content_purpose: u32,
-    /// 当前活跃 context 及其专属 serial。
-    ///
-    /// serial 必须与 context 成对存放：两个 context 各有独立的
-    /// `commit_state` 序列，混用会让应用收到不属于自己的 serial，
-    /// `commit_string`/`preedit_string` 被应用按序列号丢弃——表现为
-    /// "候选词正常出现，但选词后不上屏"。
-    pub context: Arc<Mutex<Option<ActiveContext>>>,
+    pub context: Arc<Mutex<Option<ZwpInputMethodContextV1>>>,
     pub keyboard: Arc<Mutex<Option<WlKeyboard>>>,
     pub key_events: Arc<Mutex<Vec<KeyEvent>>>,
     pub pointer_events: Arc<Mutex<Vec<PointerEvent>>>,
@@ -205,37 +163,18 @@ impl Dispatch<ZwpInputMethodV1, InputMethodV1Data> for InputMethodV1Data {
                     debug!("Grabbed keyboard successfully");
                 }
                 if let Ok(mut ctx) = state.context.lock() {
-                    *ctx = Some(ActiveContext {
-                        ctx: id,
-                        // 新 context 的第一个 serial 会在紧随其后的
-                        // commit_state 事件里到达；先用 0 占位。
-                        serial: 0,
-                    });
+                    *ctx = Some(id);
                     debug!("Stored context successfully");
                 }
             }
-            ImV1Event::Deactivate { context } => {
+            ImV1Event::Deactivate { context: _ } => {
                 debug!("zwp_input_method_v1 DEACTIVATE event received");
                 state.state = InputMethodV1State::Inactive;
-                // 只在停用的正是当前活跃 context 时才清引用。
-                // KWin 多窗口下，窗口 A 失焦发的 DEACTIVATE 不能把
-                // 窗口 B 刚 grab 到的 context 一起抹掉——否则 B 的按键
-                // 没有任何 context 可转发，输入法在 B 里"突然不工作了"。
-                let same_ctx = state
-                    .context
-                    .lock()
-                    .ok()
-                    .and_then(|ctx| ctx.as_ref().map(|active| active.ctx == context))
-                    .unwrap_or(false);
-                if same_ctx {
-                    if let Ok(mut ctx) = state.context.lock() {
-                        *ctx = None;
-                    }
-                    if let Ok(mut kb) = state.keyboard.lock() {
-                        *kb = None;
-                    }
-                } else {
-                    debug!("DEACTIVATE for a non-active context, keeping current one");
+                if let Ok(mut ctx) = state.context.lock() {
+                    *ctx = None;
+                }
+                if let Ok(mut kb) = state.keyboard.lock() {
+                    *kb = None;
                 }
             }
         }
@@ -249,24 +188,12 @@ impl Dispatch<ZwpInputMethodV1, InputMethodV1Data> for InputMethodV1Data {
 impl Dispatch<ZwpInputMethodContextV1, InputMethodV1Data> for InputMethodV1Data {
     fn event(
         state: &mut InputMethodV1Data,
-        proxy: &ZwpInputMethodContextV1,
+        _proxy: &ZwpInputMethodContextV1,
         event: <ZwpInputMethodContextV1 as Proxy>::Event,
         _data: &InputMethodV1Data,
         _conn: &wayland_client::Connection,
         _qhandle: &QueueHandle<InputMethodV1Data>,
     ) {
-        // 2026-10-26 实锤：KWin 为每个文本输入客户端各建一个
-        // `zwp_input_method_context_v1`，它们**同时**有事件进来（日志里
-        // commit_state 两条序列 294,1805,1806,295,1807… 严格交替）。
-        // 只有当前活跃 context 的事件才应影响共享状态，否则窗口 A 的
-        // serial / 环绕文本会覆盖窗口 B 的，提交请求被按序列号丢弃。
-        let is_active_ctx = state
-            .context
-            .lock()
-            .ok()
-            .and_then(|ctx| ctx.as_ref().map(|a| a.ctx == *proxy))
-            .unwrap_or(false);
-
         match event {
             ContextEvent::SurroundingText {
                 text,
@@ -274,54 +201,30 @@ impl Dispatch<ZwpInputMethodContextV1, InputMethodV1Data> for InputMethodV1Data 
                 anchor,
             } => {
                 debug!(
-                    "Context SURROUNDING_TEXT: cursor={}, anchor={}, len={}, active={}",
+                    "Context SURROUNDING_TEXT: cursor={}, anchor={}, len={}",
                     cursor,
                     anchor,
-                    text.len(),
-                    is_active_ctx
+                    text.len()
                 );
-                if is_active_ctx {
-                    state.surrounding_text = Some(text);
-                    state.surrounding_cursor = cursor;
-                    state.surrounding_anchor = anchor;
-                }
+                state.surrounding_text = Some(text);
+                state.surrounding_cursor = cursor;
+                state.surrounding_anchor = anchor;
             }
             ContextEvent::ContentType { hint, purpose } => {
-                debug!(
-                    "Context CONTENT_TYPE: hint={}, purpose={}, active={}",
-                    hint, purpose, is_active_ctx
-                );
-                if is_active_ctx {
-                    state.content_hint = hint;
-                    state.content_purpose = purpose;
-                }
+                debug!("Context CONTENT_TYPE: hint={}, purpose={}", hint, purpose);
+                state.content_hint = hint;
+                state.content_purpose = purpose;
             }
             ContextEvent::CommitState { serial } => {
-                debug!(
-                    "Context COMMIT_STATE: serial={}, active={}",
-                    serial, is_active_ctx
-                );
-                if is_active_ctx {
-                    state.serial = serial;
-                    // serial 与 context 成对保存：发请求时取这一对，
-                    // 才能保证序列号属于该 context。
-                    if let Ok(mut ctx) = state.context.lock() {
-                        if let Some(active) = ctx.as_mut() {
-                            active.serial = serial;
-                        }
-                    }
-                }
+                debug!("Context COMMIT_STATE: serial={}", serial);
+                state.serial = serial;
             }
             ContextEvent::Reset => {
-                debug!("Context RESET event received, active={}", is_active_ctx);
+                debug!("Context RESET event received");
                 // 协议要求：应用 reset 后组合器应清空 IM 侧组合状态。
                 // 置位待 daemon 取走处理（协议层不持有 Rime）。
-                // 非活跃 context 的 reset 不能清当前组合：那是另一个窗口的
-                // 输入状态，清掉会导致当前窗口正在打的字被吞。
-                if is_active_ctx {
-                    if let Ok(mut pending) = state.reset_pending.lock() {
-                        *pending = true;
-                    }
+                if let Ok(mut pending) = state.reset_pending.lock() {
+                    *pending = true;
                 }
             }
             _ => {
@@ -824,35 +727,6 @@ impl WaylandConnectionV1 {
         Ok(())
     }
 
-    /// 主动拆除 IM 对象，让合成器尽快注销本客户端。
-    ///
-    /// daemon 在 launcher 接管连接前必须调用本方法：`drop` 只关本地
-    /// socket，旧 IM 对象可能残留并与新连接并存，两个客户端争抢
-    /// keyboard grab 表现为 ACTIVATE/DEACTIVATE 抖动（2026-10-26 实锤）。
-    ///
-    /// 注意：`zwp_input_method_v1` 协议**没有 destroy 请求**（该对象由
-    /// 合成器创建，客户端只能 get_input_panel_surface），因此这里能做的
-    /// 只是丢弃全部子对象引用并 flush，真正注销依赖调用方随后 drop 掉
-    /// 整条连接——断开 socket 后合成器会回收该客户端的所有对象。
-    pub fn teardown_im_objects(&mut self) -> Result<()> {
-        self.panel_surface = None;
-        self.voice_panel_surface = None;
-        self.candidate_surface = None;
-        self.voice_surface_obj = None;
-        self.current_buffer = None;
-        self.current_pool = None;
-        self.voice_buffer = None;
-        self.voice_pool = None;
-        self.input_panel = None;
-        self.input_method = None;
-        self.state.state = InputMethodV1State::Inactive;
-
-        // 把挂起请求（含未完成的 surface/buffer 销毁）刷给合成器，
-        // 让它在 socket 关闭前尽可能处理完。
-        let _ = self.connection.flush();
-        Ok(())
-    }
-
     pub fn get_state(&self) -> &InputMethodV1Data {
         &self.state
     }
@@ -916,30 +790,26 @@ impl WaylandConnectionV1 {
         &mut self.event_queue
     }
 
-    pub fn get_context(&self) -> Option<ActiveContext> {
+    pub fn get_context(&self) -> Option<ZwpInputMethodContextV1> {
         self.state.context.lock().ok().and_then(|ctx| ctx.clone())
     }
 
     pub fn commit_string(&self, text: &str) {
-        if let Some(active) = self.get_context() {
-            active.ctx.commit_string(active.serial, text.to_string());
+        if let Some(ctx) = self.get_context() {
+            ctx.commit_string(self.state.serial, text.to_string());
         }
     }
 
     pub fn set_preedit(&self, text: &str, cursor: i32) {
-        if let Some(active) = self.get_context() {
-            active.ctx.preedit_cursor(cursor);
-            active
-                .ctx
-                .preedit_string(active.serial, text.to_string(), "".to_string());
+        if let Some(ctx) = self.get_context() {
+            ctx.preedit_cursor(cursor);
+            ctx.preedit_string(self.state.serial, text.to_string(), "".to_string());
         }
     }
 
     pub fn clear_preedit(&self) {
-        if let Some(active) = self.get_context() {
-            active
-                .ctx
-                .preedit_string(active.serial, "".to_string(), "".to_string());
+        if let Some(ctx) = self.get_context() {
+            ctx.preedit_string(self.state.serial, "".to_string(), "".to_string());
         }
     }
 
@@ -951,33 +821,9 @@ impl WaylandConnectionV1 {
     }
 
     pub fn forward_key(&self, serial: u32, time: u32, key: u32, pressed: bool) {
-        if let Some(active) = self.get_context() {
+        if let Some(ctx) = self.get_context() {
             let key_state: u32 = if pressed { 1 } else { 0 };
-            active.ctx.key(serial, time, key, key_state);
-        }
-    }
-
-    /// 把 `wl_keyboard::modifiers` 事件转发给应用。
-    ///
-    /// 2026-10-26 实锤：grab 键盘后只转发 `key` 而不转发 `modifiers`，应用
-    /// 永远不知道有修饰键按着——终端里 Ctrl+C（SIGINT）、Ctrl+X、Ctrl+Z
-    /// 全部失效，因为应用收到的是一个"孤立的 c"。协议里 `modifiers` 与
-    /// `key` 是配套的：`key` 只传按键本身，修饰位全靠 `modifiers` 通知。
-    ///
-    /// `serial` 必须用键盘事件的 serial（而非最近一次 commit_state 的），
-    /// 应用按 serial 顺序匹配修饰状态与按键。
-    pub fn forward_modifiers(
-        &self,
-        serial: u32,
-        mods_depressed: u32,
-        mods_latched: u32,
-        mods_locked: u32,
-        group: u32,
-    ) {
-        if let Some(active) = self.get_context() {
-            active
-                .ctx
-                .modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+            ctx.key(serial, time, key, key_state);
         }
     }
 

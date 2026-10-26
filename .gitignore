@@ -9,4 +9,3 @@
 /packaging/arch/pkg/
 *.pkg.tar.zst
 *.deb
-.workbuddy

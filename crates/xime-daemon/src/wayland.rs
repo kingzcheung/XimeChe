@@ -233,6 +233,22 @@ impl HealScheduler {
     }
 }
 
+/// 检测 xime-launcher 是否在运行，用于区分 KWin 会话与 standalone 会话。
+///
+/// KWin 会话下 launcher 常驻（KWin 拉起并保持），此时 daemon 必须等它传
+/// fd，绝不能抢先直连——否则会出现两个 IM 客户端抢 keyboard grab
+/// （见主循环处 2026-10-26 的说明）。
+fn xime_launcher_running() -> bool {
+    // pgrep -x 精确匹配进程名，退出码 0 = 存在
+    matches!(
+        std::process::Command::new("pgrep")
+            .args(["-x", "xime-launcher"])
+            .stdout(std::process::Stdio::null())
+            .status(),
+        Ok(status) if status.success()
+    )
+}
+
 /// 终结滞留的 xime-launcher 进程。KWin 只在 IM 客户端 CrashExit 时重拉
 /// launcher（干净退出不重拉），新 launcher 会重新调 OpenWaylandSocket
 /// 传入新 fd，整链恢复。返回是否真的终结了进程。
@@ -266,6 +282,28 @@ fn kill_lingering_launcher() -> bool {
 fn clean_exit() -> ! {
     std::thread::sleep(Duration::from_millis(150));
     unsafe { libc::_exit(0) }
+}
+
+/// 退出前拆除 IM 连接，让合成器立刻回收 keyboard grab。
+///
+/// 2026-10-26 实锤：`clean_exit()` 直接 `_exit(0)` 跳过所有析构，Wayland
+/// 连接不会走正常关闭流程。KWin 侧若没在客户端消失时及时回收 grab，键盘
+/// 事件会持续被路由到一个已死客户端的通道——表现就是**系统级快捷键全部
+/// 失灵**（Alt+Tab、Super、Ctrl+C 一概无反应）。
+///
+/// `zwp_input_method_v1` 没有 release grab 请求，客户端无法主动释放；能做
+/// 的是显式拆对象 + flush + 关闭连接，让 KWin 走"客户端断开"路径立刻回收。
+fn shutdown_im_connection(conn: &mut Option<Box<dyn ImBackend>>) {
+    if let Some(mut c) = conn.take() {
+        if let Err(e) = c.shutdown() {
+            warn!("Shutdown: IM teardown failed: {}", e);
+        }
+        // flush 已包含在 shutdown 内；这里再兜一次，确保断开前请求送达。
+        if let Err(e) = c.flush() {
+            warn!("Shutdown: IM flush failed: {}", e);
+        }
+        drop(c);
+    }
 }
 
 pub struct WaylandLoop {
@@ -330,6 +368,9 @@ impl WaylandLoop {
         let mut ctrl_root_visible = false;
         let mut last_ascii_mode = false;
         let mut last_active = false;
+        // 最近一次转发给应用的修饰键状态（避免每键重复发 modifiers）。
+        // None 表示首次，必须发一次让应用拿到正确的初始修饰状态。
+        let mut forwarded_modifiers: Option<u32> = None;
         // 输入法启停开关（Ctrl+Space 切换）：停用态按键直接转发，不做任何处理。
         let mut im_enabled = true;
         // 暗色模式切换后待重绘标记（渲染需在 conn 作用域内进行）
@@ -344,21 +385,35 @@ impl WaylandLoop {
         let _ = self.sync_tx.send(SyncMessage::Pull);
 
         // 无 launcher 的会话（GNOME 等）：直接连接 $WAYLAND_DISPLAY 使用 v2 协议。
-        // KWin 下普通 socket 不暴露 IM 协议，此步会失败，随后等待 launcher 传入 fd。
-        match connect_im_to_env() {
-            Ok(backend) => {
-                info!("Connected directly to compositor (standalone mode)");
-                conn = Some(backend);
-            }
-            Err(e) => {
-                debug!(
-                    "Direct connection not available (waiting for launcher fd): {}",
-                    e
-                );
-                // KWin 下这是常态（普通 socket 无 IM 协议）；排个自愈时间，
-                // 若 launcher 的 fd 一直不来（launcher 启动即死等场景），
-                // 到点后杀滞留 launcher 逼 KWin 重拉，而不是永久干等。
-                heal.on_disconnect(Instant::now());
+        //
+        // 2026-10-26 修正：原假设「KWin 下普通 socket 不暴露 IM 协议，此步
+        // 必然失败」在 KWin 6.7.4 上**不成立**——普通 socket 同样暴露
+        // zwp_input_method_v1，直连会成功。此时 launcher 随后送来 fd，daemon
+        // 就有了两条连接、两个 IM 对象同时向 KWin 注册，双方争抢 keyboard
+        // grab，表现为 ACTIVATE/DEACTIVATE 成对快速抖动、按键被吞，用户侧
+        // 就是"输入法完全失效"。而 zwp_input_method_v1 没有 destroy 请求，
+        // 客户端无法主动注销旧对象，只能靠断开整条连接。
+        //
+        // 因此：只要 launcher 在运行（KWin 会话），就不做直连，改由 launcher
+        // 传 fd 建立唯一连接。launcher 缺席（GNOME/wlroots）时才直连。
+        let launcher_running = xime_launcher_running();
+        if launcher_running {
+            debug!("xime-launcher is running, deferring to its fd (KWin mode)");
+        } else {
+            match connect_im_to_env() {
+                Ok(backend) => {
+                    info!("Connected directly to compositor (standalone mode)");
+                    conn = Some(backend);
+                }
+                Err(e) => {
+                    debug!(
+                        "Direct connection not available (waiting for launcher fd): {}",
+                        e
+                    );
+                    // 排个自愈时间，若 launcher 的 fd 一直不来（launcher 启动即
+                    // 死等场景），到点后杀滞留 launcher 逼 KWin 重拉，而不是永久干等。
+                    heal.on_disconnect(Instant::now());
+                }
             }
         }
 
@@ -370,6 +425,28 @@ impl WaylandLoop {
                     debug!("Connecting from fd for display {}", display_name);
 
                     xkb = XkbContext::new().ok();
+
+                    // 旧连接必须显式拆除后再接管新 fd。
+                    //
+                    // 背景（2026-10-26 实锤）：启动时 `connect_im_to_env()`
+                    // 在 KWin 6.x 上**也可能成功**——KWin 6.7.4 的普通 socket
+                    // 同样暴露 zwp_input_method_v1，与"KWin 下直连必败"的旧
+                    // 假设不符。此时 launcher 再送来 fd，若直接 `conn = Some(新)`
+                    // 覆盖，旧连接不会 drop，其 IM 对象仍在 KWin 侧注册——
+                    // KWin 眼里出现两个输入法客户端，双方争抢 keyboard grab，
+                    // 表现为 ACTIVATE/DEACTIVATE 成对快速抖动、按键被吞，
+                    // 用户侧就是"输入法完全失效"。
+                    //
+                    // 拆除顺序：先 shutdown 通知 KWin 注销 IM 对象，再 drop
+                    // 释放 socket（drop 本身不保证对象销毁消息送达）。
+                    if let Some(mut old) = conn.take() {
+                        debug!("Dropping previous IM connection before launcher takeover");
+                        if let Err(e) = old.shutdown() {
+                            warn!("Previous IM connection shutdown failed: {}", e);
+                        }
+                        drop(old);
+                        last_active = false;
+                    }
 
                     match connect_im_from_fd(fd) {
                         Ok(backend) => {
@@ -521,7 +598,12 @@ impl WaylandLoop {
                     // 必须整进程退出：DBus 主循环不感知该命令；clean_exit 保
                     // 证退出码为 0（librime 静态析构段错误会让 exit() 变成
                     // CrashExit，触发 KWin 崩溃保护计数）。
-                    info!("Shutdown requested, exiting process with status 0");
+                    //
+                    // 但退出前必须先拆 IM 连接并 flush：_exit 跳过析构，
+                    // 连接不会正常关闭，KWin 侧的 keyboard grab 可能残留导致
+                    // 系统级快捷键全部失灵（2026-10-26 实锤）。
+                    info!("Shutdown requested, tearing down IM connection then exiting");
+                    shutdown_im_connection(&mut conn);
                     clean_exit();
                 }
                 Err(TryRecvError::Empty) => {}
@@ -529,7 +611,8 @@ impl WaylandLoop {
                     // 命令通道是 daemon 的生命线（fd/托盘/部署全走这里），
                     // 断了只能整进程退出；返回 run() 会让线程静默死亡，
                     // daemon 变成"活着但永远收不到 fd"的僵尸。
-                    error!("Command channel disconnected, exiting");
+                    error!("Command channel disconnected, tearing down IM then exiting");
+                    shutdown_im_connection(&mut conn);
                     clean_exit();
                 }
             }
@@ -593,6 +676,9 @@ impl WaylandLoop {
                         debug!("Residual panel on re-activate, dismissing");
                         panel_state = PanelState::Closed;
                         panel = PanelData::default();
+                        // 新上下文建立：修饰键转发状态必须重置，否则应用
+                        // 可能沿用上一个窗口残留的 Ctrl 按下态。
+                        forwarded_modifiers = None;
                         // 兜底清滞留语音事件：失活路径的 clear_events 可能早于
                         // worker finalize 发出 Committed（收尾是异步的），不清
                         // 的话上一窗口的尾巴文本会在新窗口首次 drain 时上屏。
@@ -655,6 +741,7 @@ impl WaylandLoop {
                         &mut last_ascii_mode,
                         &mut im_enabled,
                         &mut voice,
+                        &mut forwarded_modifiers,
                     );
                 }
 
@@ -697,6 +784,7 @@ impl WaylandLoop {
         last_ascii_mode: &mut bool,
         im_enabled: &mut bool,
         voice: &mut VoiceUiState,
+        forwarded_modifiers: &mut Option<u32>,
     ) {
         if let Some(ref mut x) = xkb {
             if let Some((fd, size)) = c.get_keymap_pending() {
@@ -802,6 +890,7 @@ impl WaylandLoop {
                         last_ascii_mode,
                         im_enabled,
                         voice,
+                        forwarded_modifiers,
                     );
                 }
             }
@@ -830,6 +919,7 @@ impl WaylandLoop {
         last_ascii_mode: &mut bool,
         im_enabled: &mut bool,
         voice: &mut VoiceUiState,
+        forwarded_modifiers: &mut Option<u32>,
     ) {
         let modifiers = xkb.get_modifiers();
         let release_mask = if !event.pressed {
@@ -1097,6 +1187,29 @@ impl WaylandLoop {
                 event.key,
                 system_shortcut,
             ) {
+                // 修饰键状态必须先于按键转发给应用。
+                //
+                // 2026-10-26 实锤：grab 键盘后只转发 `key` 而不转发
+                // `modifiers`，应用永远不知道 Ctrl 正被按住——终端里
+                // Ctrl+C（SIGINT）、Ctrl+X、Ctrl+Z 全部失效，应用收到的是
+                // 一个不带修饰的孤立字符。协议中两者是配套的：`key` 只传
+                // 按键本身，修饰位全靠 `modifiers` 通知。
+                //
+                // 只在修饰键状态有变化时发，避免每个按键都多一次请求
+                // （修饰键本身的按下/释放正好就是变化点）。
+                // 只在修饰键状态有变化时发，避免每个按键都多一次请求。
+                // 首帧（forwarded_modifiers 为 None）必发，保证应用初始就
+                // 拿到正确的修饰状态。
+                if *forwarded_modifiers != Some(modifiers.effective) {
+                    c.forward_modifiers(
+                        event.serial,
+                        modifiers.depressed,
+                        modifiers.latched,
+                        modifiers.locked,
+                        modifiers.layout,
+                    );
+                    *forwarded_modifiers = Some(modifiers.effective);
+                }
                 c.forward_key(event.serial, event.time, event.key, event.pressed);
             }
             if result && event.pressed && !system_shortcut {
@@ -2233,6 +2346,19 @@ mod tests {
         assert!(should_forward_key(true, false, &consumed, 10, false));
         // 空组合态释放：未消费 → 转发
         assert!(should_forward_key(false, false, &consumed, 10, false));
+    }
+
+    /// 系统快捷键（Ctrl/Alt/Super 组合）必须一律转发。
+    ///
+    /// 回归防护：终端的 Ctrl+C(SIGINT) / Ctrl+X / Ctrl+Z 依赖应用同时收到
+    /// `key` 和 `modifiers`。这里守 `key` 部分；`modifiers` 由
+    /// `ImBackend::forward_modifiers` 负责（v1 必须实现，v2 合成器自理）。
+    #[test]
+    fn test_system_shortcut_always_forwarded() {
+        let consumed: HashSet<u32> = HashSet::new();
+        // Rime 即使消费了（result=true），带修饰键也必须转发
+        assert!(should_forward_key(true, true, &consumed, 46, true));
+        assert!(should_forward_key(false, false, &consumed, 46, true));
     }
 
     #[test]

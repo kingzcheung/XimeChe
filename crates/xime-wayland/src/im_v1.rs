@@ -827,6 +827,52 @@ impl WaylandConnectionV1 {
         }
     }
 
+    /// 把 `wl_keyboard::modifiers` 事件转发给应用。
+    ///
+    /// 2026-10-26 实锤：grab 键盘后只转发 `key` 而不转发 `modifiers`，应用
+    /// 永远不知道有修饰键按着——终端里 Ctrl+C（SIGINT）、Ctrl+X、Ctrl+Z
+    /// 全部失效，因为应用收到的是一个"孤立的 c"。协议里 `modifiers` 与
+    /// `key` 是配套的：`key` 只传按键本身，修饰位全靠 `modifiers` 通知。
+    ///
+    /// `serial` 必须用键盘事件的 serial（而非最近一次 commit_state 的），
+    /// 应用按 serial 顺序匹配修饰状态与按键。
+    pub fn forward_modifiers(
+        &self,
+        serial: u32,
+        mods_depressed: u32,
+        mods_latched: u32,
+        mods_locked: u32,
+        group: u32,
+    ) {
+        if let Some(ctx) = self.get_context() {
+            ctx.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+        }
+    }
+
+    /// 拆除 IM 协议对象，用于连接销毁前的清理。
+    ///
+    /// `zwp_input_method_v1` 与 `zwp_input_method_context_v1` 在协议里
+    /// **都没有 destroy 请求**，客户端无法主动注销，只能清掉本地引用 +
+    /// flush 后断开连接，让合成器回收 grab。
+    pub fn teardown_im_objects(&mut self) -> Result<()> {
+        self.panel_surface = None;
+        self.voice_panel_surface = None;
+        self.candidate_surface = None;
+        self.voice_surface_obj = None;
+        self.current_buffer = None;
+        self.current_pool = None;
+        self.voice_buffer = None;
+        self.voice_pool = None;
+        self.input_panel = None;
+        self.input_method = None;
+        self.state.state = InputMethodV1State::Inactive;
+
+        // 把挂起请求（含未完成的 surface/buffer 销毁）刷给合成器，
+        // 让它在 socket 关闭前尽可能处理完。
+        let _ = self.connection.flush();
+        Ok(())
+    }
+
     pub fn create_candidate_surface(&mut self) -> Result<()> {
         let compositor = self.compositor.as_ref().ok_or(Error::NoCompositor)?;
         let input_panel = self.input_panel.as_ref().ok_or(Error::NoInputPanel)?;

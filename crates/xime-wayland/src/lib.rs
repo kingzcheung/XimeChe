@@ -54,6 +54,22 @@ pub trait ImBackend {
     fn get_modifiers(&self) -> (u32, u32, u32, u32);
     fn get_keymap_pending(&self) -> Option<(OwnedFd, usize)>;
     fn forward_key(&self, serial: u32, time: u32, key: u32, pressed: bool);
+    /// 把修饰键状态转发给应用。
+    ///
+    /// v1（grab_keyboard 模型）**必须**调用：`key` 只携带按键本身，修饰位
+    /// 全靠本请求通知。漏掉它会让终端里 Ctrl+C/Ctrl+X/Ctrl+Z 全部失效——
+    /// 应用收到的是一个不带 Ctrl 的孤立字符（2026-10-26 实锤）。
+    ///
+    /// v2（text-input-v3）由合成器自己维护修饰状态，无需转发：默认空实现。
+    fn forward_modifiers(
+        &self,
+        _serial: u32,
+        _mods_depressed: u32,
+        _mods_latched: u32,
+        _mods_locked: u32,
+        _group: u32,
+    ) {
+    }
     fn commit_string(&self, text: &str);
     fn set_preedit(&self, text: &str, cursor: i32);
     fn clear_preedit(&self);
@@ -99,6 +115,12 @@ pub trait ImBackend {
     /// Recreate the input method object after the compositor reports it
     /// unavailable (e.g. GNOME lock screen). No-op on v1.
     fn handle_unavailable(&mut self) -> Result<(), String>;
+    /// 主动拆除连接：销毁 IM 对象并 flush，让合成器立刻注销本客户端。
+    ///
+    /// daemon 在 launcher 送来新 fd 时需要先拆旧连接——仅靠 `drop` 不能保证
+    /// 销毁消息送达合成器，旧 IM 对象会残留在合成器侧与新的并存，两个客户端
+    /// 争抢 keyboard grab 表现为 ACTIVATE/DEACTIVATE 抖动（2026-10-26 实锤）。
+    fn shutdown(&mut self) -> Result<(), String>;
     /// 应用请求清空组合（v1 context.reset；v2 无此事件，恒 false）。取走即清。
     fn take_reset_pending(&self) -> bool {
         false
@@ -136,6 +158,17 @@ impl ImBackend for im_v1::WaylandConnectionV1 {
 
     fn forward_key(&self, serial: u32, time: u32, key: u32, pressed: bool) {
         self.forward_key(serial, time, key, pressed)
+    }
+
+    fn forward_modifiers(
+        &self,
+        serial: u32,
+        mods_depressed: u32,
+        mods_latched: u32,
+        mods_locked: u32,
+        group: u32,
+    ) {
+        self.forward_modifiers(serial, mods_depressed, mods_latched, mods_locked, group)
     }
 
     fn commit_string(&self, text: &str) {
@@ -218,6 +251,10 @@ impl ImBackend for im_v1::WaylandConnectionV1 {
 
     fn handle_unavailable(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.teardown_im_objects().map_err(|e| e.to_string())
     }
 }
 
@@ -313,6 +350,10 @@ impl ImBackend for im_v2::WaylandConnectionV2 {
 
     fn handle_unavailable(&mut self) -> Result<(), String> {
         self.handle_unavailable().map_err(|e| e.to_string())
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.teardown_im_objects().map_err(|e| e.to_string())
     }
 }
 

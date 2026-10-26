@@ -1,9 +1,44 @@
 # XimeChe（曦码·澈输入法）开发进度
 
 ## 当前状态
-**修复：Ctrl/Alt/Super 组合键被 Rime 吞掉，导致所有 Ctrl 快捷键失效**
-（2026-10-23）。此前：多发行版打包（2026-10-23）、Wayland 连接楔死导致按键黑洞修复
-（2026-10-11）、语音交互层（5dc47e3）、日志体系 + 全仓审查（2026-10-07）。
+**修复：失活状态下仍处理按键，导致中文提交丢失 + 应用直出字母**
+（2026-10-26）。
+
+**根因**：`wl_keyboard::Event::Key` 是挂在 **wl_keyboard 对象**上的回调，
+不是挂在 context 上。`grab_keyboard` 之后 KWin 会持续往该 keyboard 发
+按键，**不管 context 还活不活**。`DEACTIVATE` 只把 context 置 `None`，
+keyboard 对象仍在，于是按键继续入队 → Rime 继续组词 →
+`commit_string` 提交给一个 `None` 的 context（请求被丢弃）。
+
+用户侧表现是两件事同时发生：**中文没进去**（提交丢失）+ **反而出字母**
+（此时无有效 grab 拦截，应用把裸按键当普通字符处理）。
+
+**日志实锤**（22:05:17–22，用户当时正在 WorkBuddy 里报障）：
+```
+Committed: 是 / 直接 / 出 / 字母 / 的     ← daemon 提交的正是用户那句话
+```
+提交全部成功，但期间 **2 分 44 秒零次 ACTIVATE**（22:02:38 DEACTIVATE 后
+再无激活），提交全部落空。
+
+**修复**：`im_v1.rs` 的 `Key` 处理里加守卫——没有活跃 context 时丢弃按键，
+不送进 Rime。纯防御性，最坏情况回到"什么都没发生"。
+
+**未修的已知问题**：Alt+Tab 会触发 KWin 在 1ms 内连发多轮
+ACTIVATE/DEACTIVATE（实测 `.873247 ACTIVATE → .873414 DEACTIVATE →
+.874523 ACTIVATE`），而 v1 的 `grab_keyboard` **无 release 请求**、
+`context` **无 destroy 请求**，每次重复 grab 都在合成器侧留孤儿。
+全天 ACTIVATE 454 : DEACTIVATE 224。这个只能在合成器侧重连时自然回收，
+客户端无解。
+
+**曾尝试并自我否决**：抖动期复用旧 grab。查协议后确认
+`grab_keyboard` 是 **context 的请求**（`keyboard` 是它的 new_id），
+每个 context 需自己的 grab，复用旧 grab 是违反协议的。已回退。
+
+验证：`xime-wayland` 18 测试通过，`clippy -D warnings` 干净，
+release 已装（md5 `a981ab3f…`，上一版 `xime-daemon.old7`）。
+
+此前已完成：v1 转发 modifiers（Ctrl+C 修复）、退出拆 IM 连接、
+禁止双 IM 连接、librime ABI 重编译（均 2026-10-26）。
 
 ## 本次变更（2026-10-23）：Ctrl 快捷键被输入法吞掉
 

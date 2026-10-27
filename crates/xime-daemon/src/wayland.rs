@@ -368,9 +368,11 @@ impl WaylandLoop {
         let mut ctrl_root_visible = false;
         let mut last_ascii_mode = false;
         let mut last_active = false;
-        // 最近一次转发给应用的修饰键状态（避免每键重复发 modifiers）。
-        // None 表示首次，必须发一次让应用拿到正确的初始修饰状态。
-        let mut forwarded_modifiers: Option<u32> = None;
+        // 注意：**不要在这里维护「上次转发的修饰键状态」**。
+        // KWin 会为多个窗口同时保留多个 zwp_input_method_context_v1，
+        // 任何全局单值缓存都会让「按下」发给 A、「松开」发给 B，A 那侧
+        // 永久残留 Ctrl 按下态（鼠标点击不会触发按键，永远纠正不回来）。
+        // 详见 DECISIONS.md「禁止转发 modifiers」。
         // 输入法启停开关（Ctrl+Space 切换）：停用态按键直接转发，不做任何处理。
         let mut im_enabled = true;
         // 暗色模式切换后待重绘标记（渲染需在 conn 作用域内进行）
@@ -676,9 +678,6 @@ impl WaylandLoop {
                         debug!("Residual panel on re-activate, dismissing");
                         panel_state = PanelState::Closed;
                         panel = PanelData::default();
-                        // 新上下文建立：修饰键转发状态必须重置，否则应用
-                        // 可能沿用上一个窗口残留的 Ctrl 按下态。
-                        forwarded_modifiers = None;
                         // 兜底清滞留语音事件：失活路径的 clear_events 可能早于
                         // worker finalize 发出 Committed（收尾是异步的），不清
                         // 的话上一窗口的尾巴文本会在新窗口首次 drain 时上屏。
@@ -741,7 +740,6 @@ impl WaylandLoop {
                         &mut last_ascii_mode,
                         &mut im_enabled,
                         &mut voice,
-                        &mut forwarded_modifiers,
                     );
                 }
 
@@ -784,7 +782,6 @@ impl WaylandLoop {
         last_ascii_mode: &mut bool,
         im_enabled: &mut bool,
         voice: &mut VoiceUiState,
-        forwarded_modifiers: &mut Option<u32>,
     ) {
         if let Some(ref mut x) = xkb {
             if let Some((fd, size)) = c.get_keymap_pending() {
@@ -890,7 +887,6 @@ impl WaylandLoop {
                         last_ascii_mode,
                         im_enabled,
                         voice,
-                        forwarded_modifiers,
                     );
                 }
             }
@@ -919,7 +915,6 @@ impl WaylandLoop {
         last_ascii_mode: &mut bool,
         im_enabled: &mut bool,
         voice: &mut VoiceUiState,
-        forwarded_modifiers: &mut Option<u32>,
     ) {
         let modifiers = xkb.get_modifiers();
         let release_mask = if !event.pressed {
@@ -1187,29 +1182,19 @@ impl WaylandLoop {
                 event.key,
                 system_shortcut,
             ) {
-                // 修饰键状态必须先于按键转发给应用。
+                // 只转发 `key`，**不再转发 `modifiers`**。
                 //
-                // 2026-10-26 实锤：grab 键盘后只转发 `key` 而不转发
-                // `modifiers`，应用永远不知道 Ctrl 正被按住——终端里
-                // Ctrl+C（SIGINT）、Ctrl+X、Ctrl+Z 全部失效，应用收到的是
-                // 一个不带修饰的孤立字符。协议中两者是配套的：`key` 只传
-                // 按键本身，修饰位全靠 `modifiers` 通知。
+                // 2026-10-26 曾加上 forward_modifiers（为修终端的 Ctrl+C），
+                // 结果把系统级 Ctrl 搞死了：KWin 同时为多个窗口各保留一个
+                // zwp_input_method_context_v1，而「上次转发的修饰态」只能是
+                // 一个全局值——Ctrl 的按下发给窗口 A、松开发给窗口 B，A 那侧
+                // 永久残留「Ctrl 按住」，之后所有点击都变成 Ctrl+点击、所有
+                // 按键都变成 Ctrl+键。鼠标操作不产生按键事件，所以永远纠正
+                // 不回来，只能重启 daemon。
                 //
-                // 只在修饰键状态有变化时发，避免每个按键都多一次请求
-                // （修饰键本身的按下/释放正好就是变化点）。
-                // 只在修饰键状态有变化时发，避免每个按键都多一次请求。
-                // 首帧（forwarded_modifiers 为 None）必发，保证应用初始就
-                // 拿到正确的修饰状态。
-                if *forwarded_modifiers != Some(modifiers.effective) {
-                    c.forward_modifiers(
-                        event.serial,
-                        modifiers.depressed,
-                        modifiers.latched,
-                        modifiers.locked,
-                        modifiers.layout,
-                    );
-                    *forwarded_modifiers = Some(modifiers.effective);
-                }
+                // 修饰态是**每 context 独立**的状态，在拿到按 context 隔离的
+                // 方案之前不要碰它。代价：终端里 Ctrl+C/Ctrl+X 收不到 SIGINT
+                // （已知问题，见 PROGRESS.md）。
                 c.forward_key(event.serial, event.time, event.key, event.pressed);
             }
             if result && event.pressed && !system_shortcut {

@@ -1,5 +1,37 @@
 # XimeChe（曦码·澈输入法）重要决策
 
+## 2026-10-27: 修饰键必须一对一转发，禁止任何缓存或条件门控
+
+**问题**：修终端 Ctrl+C 时，在 daemon 里加了 `forward_modifiers`，并且
+①用全局单值 `Option<u32>` 缓存"上次转发的修饰态"、②只在
+`should_forward_key` 为真时顺带转发。结果把系统级 Ctrl 搞死了：用户报
+"一切换到这个输入法，所有操作都带有 Ctrl 按下效果"。
+
+**为什么错**：
+1. KWin 会为多个窗口**同时**保留多个 `zwp_input_method_context_v1`。
+   全局单值缓存意味着 Ctrl 的"按下"可能发给窗口 A、"松开"发给窗口 B，
+   A 那侧永久残留 Ctrl 按下态。
+2. 门控在"按键是否被转发"上：Rime 消费按键时整段跳过，修饰态变化就丢失。
+   丢一次"松开"就是永久卡住——鼠标点击不产生按键事件，永远纠正不回来。
+3. 修饰态是**每 context 独立**的状态，用任何全局快照去近似都是错的。
+
+**决策**：在 `im_v1.rs` 的 `wl_keyboard::Event::Modifiers` 分支里，
+**收到就转发**给当前 context，不缓存、不判断、不看按键是否被转发：
+
+```rust
+if let Some((ctx, serial)) = /* 当前 context + 其 commit_state serial */ {
+    ctx.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+}
+```
+
+这就是 fcitx5 的做法（`waylandimserver.cpp::modifiersCallback` 里直接
+`ic_->modifiers(serial_, ...)`，并且 `FCITX_UNUSED(serial)` 忽略回调自带的
+serial，一律用 commit_state 的 `serial_`）。一对一镜像合成器的真值，
+状态天然收敛，不可能卡住。
+
+**约束**：daemon 侧不得再调用 `ImBackend::forward_modifiers`
+（该方法保留但不可用），修饰态完全由 wayland 层镜像。
+
 ## 2026-10-11: Wayland 事件泵非阻塞化 + sync 楔死探测
 
 **问题**：`dispatch_events()` 用阻塞 `roundtrip()`（内含 `blocking_read`）。

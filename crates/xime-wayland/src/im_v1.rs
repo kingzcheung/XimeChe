@@ -385,6 +385,28 @@ impl Dispatch<WlKeyboard, InputMethodV1Data> for InputMethodV1Data {
                 if let Ok(mut mods) = state.modifiers.lock() {
                     *mods = (mods_depressed, mods_latched, mods_locked, group);
                 }
+                // 修饰键事件**一对一**转发给当前 context（对齐 fcitx5
+                // waylandimserver.cpp::modifiersCallback 的做法）。
+                //
+                // 这是唯一正确的模型：`zwp_input_method_context_v1.key` 只携带
+                // 按键本体，修饰位必须靠 `modifiers` 单独通知，而且**必须在
+                // 收到 wl_keyboard.modifiers 的那一刻就转发**。
+                //
+                // 曾经的错误做法是在 daemon 里缓存"上次转发的修饰态"，只在
+                // 转发按键时顺带发一次——那样 Ctrl 的按下与松开会因为"按键被
+                // Rime 消费"而只发出去一半，客户端永久残留 Ctrl 按下态，整个
+                // 系统变成 Ctrl+点击。这里不缓存、不做条件判断，收到就转发，
+                // 状态天然收敛到合成器的真值。
+                let relay = state
+                    .context
+                    .lock()
+                    .ok()
+                    .and_then(|ctx| ctx.clone())
+                    .map(|ctx| (ctx, state.serial));
+                if let Some((ctx, serial)) = relay {
+                    ctx.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+                    debug!("Relayed MODIFIERS to context: serial={}", serial);
+                }
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
                 debug!("Keyboard REPEAT_INFO: rate={}, delay={}", rate, delay);

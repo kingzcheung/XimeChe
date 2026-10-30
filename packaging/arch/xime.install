@@ -1,9 +1,13 @@
 # shellcheck shell=bash
 # pacman 安装/升级/卸载钩子。注意：脚本的工作目录是 /。
+#
+# 不要在这里调 update-desktop-database / gtk-update-icon-cache：
+# 两者都由 pacman 的 file trigger 钩子自动完成（namcap 会报
+# ".INSTALL file runs a command ... provided by hooks"），而且 Arch
+# 基础系统里没有 gtk-update-icon-cache 可执行文件，调了只会刷
+# "command not found"。
 
 post_install() {
-    update-desktop-database -q || :
-    gtk-update-icon-cache -q -t -f usr/share/icons/hicolor || :
     cat <<'EOF'
 ==> 曦码已安装。在 KDE Plasma 中启用：
 
@@ -20,6 +24,5 @@ post_upgrade() {
 }
 
 post_remove() {
-    update-desktop-database -q || :
-    gtk-update-icon-cache -q -t -f usr/share/icons/hicolor || :
+    :
 }

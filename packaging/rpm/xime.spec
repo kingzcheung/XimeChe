@@ -53,6 +53,9 @@ BuildRequires:  dbus-devel
 %global __requires_exclude ^lib(onnxruntime|sherpa-onnx).*\\.so.*$
 
 Requires(post):   desktop-file-utils
+# %post 里调 gtk-update-icon-cache；没有这个依赖时 scriptlet 会刷
+# "command not found"（已被 || : 吞掉，但会在安装日志里报警）。
+Requires(post):   gtk-update-icon-cache
 Requires(postun): desktop-file-utils
 
 %description

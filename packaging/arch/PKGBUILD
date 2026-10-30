@@ -11,7 +11,9 @@ pkgdesc="曦码 — 基于 Rime 引擎与自绘候选窗的 Wayland 中文输入
 arch=('x86_64' 'aarch64')
 url="https://github.com/ximeiorg/XimeChe"
 license=('GPL-3.0-or-later')
-depends=('librime' 'libxkbcommon' 'wayland' 'dbus' 'bzip2' 'gcc-libs' 'hicolor-icon-theme' 'desktop-file-utils')
+# desktop-file-utils 不进 depends：它的 .desktop/MIME 缓存由 pacman 的
+# file trigger 钩子负责，.INSTALL 里不需要自己调（见 xime.install 注释）。
+depends=('librime' 'libxkbcommon' 'wayland' 'dbus' 'bzip2' 'gcc-libs' 'hicolor-icon-theme')
 makedepends=('cargo' 'rust' 'git' 'pkgconf' 'clang')
 install="$pkgname.install"
 # 关闭 makepkg 的 LTO：默认 CFLAGS 会加 -flto=auto，ring 的 build script

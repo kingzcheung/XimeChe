@@ -181,7 +181,15 @@ jobs:
         run: |
           dnf install -y ./rpmbuild/RPMS/*/*.rpm
           ldd /usr/bin/xime-daemon
-          ldd /usr/bin/xime-daemon | grep -q 'libsherpa-onnx-c-api.so => /usr/share/xime/lib/'
+          # daemon 的 rpath 是 $ORIGIN/../share/xime/lib，ldd 不会规范化路径，
+          # 输出形如 /usr/bin/../share/xime/lib/libxxx.so——所以只能匹配尾段，
+          # 不能写死成 /usr/share/xime/lib/。
+          for lib in libsherpa-onnx-c-api.so libonnxruntime.so; do
+            if ! ldd /usr/bin/xime-daemon | grep -qE "$lib => .*/share/xime/lib/"; then
+              echo "::error::$lib 未能从随包目录 share/xime/lib 解析"
+              exit 1
+            fi
+          done
           test -f /usr/share/dbus-1/services/org.xime.Xime.service
           test -f /usr/share/xime/rime-data/wubi86.schema.yaml
 
@@ -224,7 +232,13 @@ jobs:
           namcap packaging/arch/*.pkg.tar.zst || true
           pacman -U --noconfirm packaging/arch/*.pkg.tar.zst
           ldd /usr/bin/xime-daemon
-          ldd /usr/bin/xime-daemon | grep -q 'libsherpa-onnx-c-api.so => /usr/share/xime/lib/'
+          # 同 rpm job：rpath 含 $ORIGIN，ldd 输出不规范化，按尾段匹配。
+          for lib in libsherpa-onnx-c-api.so libonnxruntime.so; do
+            if ! ldd /usr/bin/xime-daemon | grep -qE "$lib => .*/share/xime/lib/"; then
+              echo "::error::$lib 未能从随包目录 share/xime/lib 解析"
+              exit 1
+            fi
+          done
           test -x /usr/bin/xime-launcher
           test -f /usr/share/dbus-1/services/org.xime.Xime.service
           test -f /usr/share/xime/rime-data/wubi86.schema.yaml

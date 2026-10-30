@@ -45,6 +45,13 @@ BuildRequires:  clang
 # libdbus-sys 走 pkg-config
 BuildRequires:  dbus-devel
 
+# 语音运行库（sherpa-onnx / onnxruntime）随包自带到 /usr/share/xime/lib，
+# daemon 用 rpath 定位，不需要系统仓库提供。但 rpm 的自动依赖扫描仍会从
+# ELF 里读出 libonnxruntime.so(VERS_x.y.z)(64bit) 之类的符号版本依赖，而
+# Fedora/openSUSE 仓库没有 onnxruntime，装包会报 "nothing provides"——
+# 过滤掉这批由自带库产生的自动依赖（不碰 librime 等真正的系统依赖）。
+%global __requires_exclude ^lib(onnxruntime|sherpa-onnx).*\\.so.*$
+
 Requires(post):   desktop-file-utils
 Requires(postun): desktop-file-utils
 

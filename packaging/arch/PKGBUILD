@@ -14,6 +14,13 @@ license=('GPL-3.0-or-later')
 depends=('librime' 'libxkbcommon' 'wayland' 'dbus' 'bzip2' 'gcc-libs' 'hicolor-icon-theme' 'desktop-file-utils')
 makedepends=('cargo' 'rust' 'git' 'pkgconf' 'clang')
 install="$pkgname.install"
+# 关闭 makepkg 的 LTO：默认 CFLAGS 会加 -flto=auto，ring 的 build script
+# 用 cc-rs 继承该标志编译自带 C 代码，产出 slim LTO 目标（符号表里只剩
+# __gnu_lto_slim）。rustc 链接时不带 -flto，LTO 插件不加载，bfd/lld 都无法
+# 按符号从 libring_core_0_17_14.a 拉取成员，链 sherpa-onnx-sys 的 build
+# script 时报大量 ring_core_0_17_14__* undefined reference。
+# Fedora 不受影响是因为它用 -ffat-lto-objects（fat LTO，归档含真实符号）。
+options=('!lto')
 # rime-wubi 是 git 子模块：makepkg 不会初始化子模块，这里单独拉取。
 # 升级子模块后请用 `git submodule status` 同步下面的 commit。
 _rime_wubi_commit=ae27544dd1ce4d795a3be1b791e9439d9612de15
@@ -31,9 +38,11 @@ prepare() {
 
 build() {
     cd "$srcdir/$pkgname"
-    # Arch 的工具链给 rustc 默认加了 -fuse-ld=lld；lld 链接 sherpa-onnx-sys
-    # 的 build script（zip 的 zstd + ring 静态库）时会漏掉 ZSTD_*/ring_core_*
-    # 符号报 undefined symbol，同一份代码在 Debian（GNU ld/bfd）上正常。
+    # 历史上 lld 链接 sherpa-onnx-sys 的 build script 报 ZSTD_*/ring_core_*
+    # undefined symbol，当时归因于 lld，改用 bfd 后一度通过；后经排查真实
+    # 原因是 makepkg 默认 LTO（见上面 options=('!lto') 的注释），slim LTO 归档
+    # 换哪个链接器都解不了符号。bfd 强制项保留作为双保险（rustc 1.90+ 在
+    # x86_64-linux-gnu 默认切到 rust-lld），bfd 对 GNU ld 行为最稳。
     # 放在 RUSTFLAGS 末尾以覆盖前面的 -fuse-ld。
     export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=bfd"
     # 不用 --locked：libximecore 的 git 依赖在本地被 .cargo/config.toml patch

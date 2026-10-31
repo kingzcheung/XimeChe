@@ -256,8 +256,20 @@ jobs:
         run: |
           cd packaging/arch
           su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --printsrcinfo" > .SRCINFO
-          test -s .SRCINFO
-          grep -q '^pkgver = ' .SRCINFO
+          # 下面两步刻意不做静默判断：一旦失败就把 .SRCINFO 打出来，
+          # 避免出现「exit code 1 但日志空白」这种无从下手的失败。
+          if [ ! -s .SRCINFO ]; then
+            echo "::error::makepkg --printsrcinfo 没有产出内容（.SRCINFO 为空）"
+            exit 1
+          fi
+          head -3 .SRCINFO
+          # .SRCINFO 里除 pkgbase 外所有字段（含 pkgver）都带 TAB 缩进，
+          # 行首锚定的 ^pkgver 永远匹配不上。
+          if ! grep -qE '^[[:space:]]*pkgver = ' .SRCINFO; then
+            echo "::error::.SRCINFO 缺少 pkgver 字段，内容如下："
+            cat .SRCINFO
+            exit 1
+          fi
           tar -czf "$GITHUB_WORKSPACE/xime-${{ needs.source.outputs.version }}-aur.tar.gz" \
             PKGBUILD .SRCINFO xime.install
 
